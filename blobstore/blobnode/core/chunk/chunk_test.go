@@ -26,35 +26,64 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
+	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
+	"github.com/cubefs/cubefs/blobstore/blobnode/base"
+	"github.com/cubefs/cubefs/blobstore/blobnode/base/flow"
 	"github.com/cubefs/cubefs/blobstore/blobnode/base/qos"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	"github.com/cubefs/cubefs/blobstore/blobnode/db"
+	"github.com/cubefs/cubefs/blobstore/common/iostat"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/testing/mocks"
 	_ "github.com/cubefs/cubefs/blobstore/testing/nolog"
 	"github.com/cubefs/cubefs/blobstore/util/log"
-	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
 const (
 	defaultDiskTestDir = "NodeDiskTestDir"
 )
 
-func newIoPoolMock(t *testing.T) map[qos.IOTypeRW]taskpool.IoPool {
+func newIoPoolMock(t *testing.T) map[bnapi.IOType]base.IoPool {
 	ctr := gomock.NewController(t)
 	ioPool := mocks.NewMockIoPool(ctr)
-	ioPool.EXPECT().Submit(gomock.Any()).Do(func(args taskpool.IoPoolTaskArgs) { args.TaskFn() }).AnyTimes()
-	return map[qos.IOTypeRW]taskpool.IoPool{
-		qos.IOTypeRead:  ioPool,
-		qos.IOTypeWrite: ioPool,
-		qos.IOTypeDel:   ioPool,
+	ioPool.EXPECT().Submit(gomock.Any()).Do(func(args base.IoPoolTaskArgs) { args.TaskFn() }).AnyTimes()
+	return map[bnapi.IOType]base.IoPool{
+		bnapi.ReadIO:       ioPool,
+		bnapi.WriteIO:      ioPool,
+		bnapi.DeleteIO:     ioPool,
+		bnapi.BackgroundIO: ioPool,
 	}
+}
+
+func newIoQosMgrMock(t *testing.T, iops int) *qos.QosMgr {
+	if iops == 0 {
+		iops = 1000
+	}
+
+	ioStat, _ := iostat.StatInit("", 0, true)
+	iom := &flow.IOFlowStat{}
+	for i := range bnapi.GetAllIOType() {
+		iom[i] = ioStat
+	}
+
+	ioQos, err := qos.NewQosMgr(qos.Config{
+		StatGetter: iom,
+		FlowConfig: qos.FlowConfig{
+			Level: qos.LevelConfigMap{
+				bnapi.ReadIO.String():       {Concurrency: int64(iops), MBPS: 100},
+				bnapi.WriteIO.String():      {Concurrency: int64(iops), MBPS: 100},
+				bnapi.DeleteIO.String():     {Concurrency: int64(iops), MBPS: 100},
+				bnapi.BackgroundIO.String(): {Concurrency: int64(iops), MBPS: 100},
+			},
+		},
+	})
+	require.NoError(t, err)
+	return ioQos
 }
 
 func TestNewChunkStorage(t *testing.T) {
@@ -91,7 +120,7 @@ func TestNewChunkStorage(t *testing.T) {
 		Status:  clustermgr.ChunkStatusNormal,
 	}
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 2)
 	defer ioQos.Close()
 	cs, err := NewChunkStorage(context.TODO(), datapath, vm, ioPools, func(option *core.Option) {
 		option.Conf = conf
@@ -119,6 +148,7 @@ func TestChunkStorage_ReadWrite(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	conf := &core.Config{
 		RuntimeConfig: core.RuntimeConfig{
@@ -151,7 +181,7 @@ func TestChunkStorage_ReadWrite(t *testing.T) {
 	}
 
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 2)
 	defer ioQos.Close()
 	cs, err := NewChunkStorage(ctx, datapath, vm, ioPools, func(option *core.Option) {
 		option.Conf = conf
@@ -347,7 +377,7 @@ func TestChunkStorage_ReadWriteInline(t *testing.T) {
 	}
 
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 2)
 	defer ioQos.Close()
 	cs, err := NewChunkStorage(ctx, datapath, vm, ioPools, func(option *core.Option) {
 		option.Conf = conf
@@ -433,6 +463,7 @@ func TestChunkStorage_DeleteOp(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	conf := &core.Config{
 		RuntimeConfig: core.RuntimeConfig{
@@ -465,7 +496,7 @@ func TestChunkStorage_DeleteOp(t *testing.T) {
 	}
 
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 2)
 	defer ioQos.Close()
 	cs, err := NewChunkStorage(ctx, datapath, vm, ioPools, func(option *core.Option) {
 		option.Conf = conf
@@ -499,6 +530,7 @@ func TestChunkStorage_DeleteOp(t *testing.T) {
 	require.NoError(t, err)
 
 	// delete failed
+	ctx = bnapi.SetIoType(ctx, bnapi.DeleteIO)
 	err = cs.Delete(ctx, 1025)
 	require.Error(t, err)
 
@@ -575,7 +607,7 @@ func TestChunkStorage_Finalizer(t *testing.T) {
 		Status:  clustermgr.ChunkStatusNormal,
 	}
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 2)
 	defer ioQos.Close()
 	cs, err := NewChunkStorage(ctx, datapath, vm, ioPools, func(option *core.Option) {
 		option.Conf = conf

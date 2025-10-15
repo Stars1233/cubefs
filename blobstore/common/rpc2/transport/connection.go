@@ -45,7 +45,8 @@ func (c *netConn) ReadBuffer(n int) (AssignedBuffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err = io.ReadFull(c.Conn, buffer.Bytes()); err != nil {
+	buffer.Written(headerSize)
+	if _, err = io.ReadFull(c.Conn, buffer.Bytes()[headerSize:]); err != nil {
 		buffer.Free()
 		return nil, err
 	}
@@ -67,11 +68,14 @@ type netConnv struct{ netConn }
 var _ WriteBuffers = netConnv{}
 
 func (c netConnv) WriteBuffers(buffers []AssignedBuffer) (int, error) {
-	v := make(net.Buffers, 0, len(buffers))
+	pv := poolBuffers.Get().(*net.Buffers)
+	v := (*pv)[:0]
 	for _, buffer := range buffers {
 		v = append(v, buffer.Bytes()[:buffer.Len()])
 	}
+	*pv = v
 	nn, err := v.WriteTo(c.netConn.Conn)
+	poolBuffers.Put(pv) // nolint: staticcheck
 	return int(nn), err
 }
 

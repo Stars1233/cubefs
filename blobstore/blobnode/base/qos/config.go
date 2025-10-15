@@ -15,76 +15,187 @@
 package qos
 
 import (
+	"errors"
+	"sync"
+
+	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/blobnode/base/flow"
 	"github.com/cubefs/cubefs/blobstore/common/iostat"
+	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/util/defaulter"
 )
 
 const (
-	defaultReadBandwidthMBPS       = 200
-	defaultWriteBandwidthMBPS      = 160
-	defaultBackgroundBandwidthMBPS = 20
-	defaultDiscardPercent          = 50
-	defaultWriteDepthCnt           = 32
-	defaultReadDepthCnt            = 64
-	defaultDeleteDepthCnt          = 32
+	defaultMaxIops        = 2000
+	defaultMaxMBps        = 250
+	defaultIntervalMs     = 500
+	defaultIdleFactor     = 0.2
+	defaultBidConcurrency = 1
+)
+
+var (
+	ErrQosWrongConfig = errors.New("wrong qos config")
+
+	defaultConfs = LevelConfigMap{
+		bnapi.ReadIO.String():       {Concurrency: 64, MBPS: 200, BusyFactor: 1.0, BidConcurrency: 32, IdleFactor: 1.0},
+		bnapi.WriteIO.String():      {Concurrency: 64, MBPS: 120, BusyFactor: 1.0, BidConcurrency: 1, IdleFactor: 1.2},
+		bnapi.DeleteIO.String():     {Concurrency: 32, MBPS: 60, BusyFactor: 0.8, BidConcurrency: 1, IdleFactor: 1.25},
+		bnapi.BackgroundIO.String(): {Concurrency: 32, MBPS: 20, BusyFactor: 0.5, BidConcurrency: 1, IdleFactor: 3.0},
+	}
 )
 
 type Config struct {
-	StatGetter flow.StatGetter `json:"-"` // Identify: a io flow
+	StatGetter flow.StatGetter `json:"-"` // Identify: an io flow
 	DiskViewer iostat.IOViewer `json:"-"` // Identify: io viewer
-
-	WriteChanQueCnt  int32 `json:"-"`                  // The number of chan queues, equal $chanCnt of write io pool
-	ReadQueueDepth   int32 `json:"read_queue_depth"`   // equal/less $queueDepth of io pool: The number of elements in the queue, must not zero
-	WriteQueueDepth  int32 `json:"write_queue_depth"`  // equal/less $queueDepth of io pool: The number of elements in the queue
-	DeleteQueueDepth int32 `json:"delete_queue_depth"` // Limit the depth of the delete queue, also used to limit concurrent
-
-	ReadMBPS       int64 `json:"read_mbps"`
-	WriteMBPS      int64 `json:"write_mbps"`
-	BackgroundMBPS int64 `json:"background_mbps"`
-	ReadDiscard    int32 `json:"read_discard"`
-	WriteDiscard   int32 `json:"write_discard"`
+	FlowConfig
 }
 
-type ParaConfig struct {
-	Bandwidth int64   `json:"bandwidth_MBPS"`
-	Factor    float64 `json:"factor"`
+type LevelConfigMap map[string]LevelFlowConfig
+
+type CommonDiskConfig struct {
+	DiskIops         int64   `json:"disk_iops"`
+	DiskBandwidthMB  int64   `json:"disk_bandwidth_mb"`  // disk total bandwidth MB/s
+	UpdateIntervalMs int64   `json:"update_interval_ms"` // dynamic update limiter interval
+	DiskIdleFactor   float64 `json:"disk_idle_factor"`   // disk is idle, raise rate factor
+
+	DiskID proto.DiskID `json:"-"`
 }
 
-type LevelConfig map[string]ParaConfig
-
-func InitAndFixQosConfig(raw *Config) {
-	defaulter.LessOrEqual(&raw.ReadMBPS, int64(defaultReadBandwidthMBPS))
-	defaulter.LessOrEqual(&raw.WriteMBPS, int64(defaultWriteBandwidthMBPS))
-	defaulter.LessOrEqual(&raw.BackgroundMBPS, int64(defaultBackgroundBandwidthMBPS))
-	defaulter.LessOrEqual(&raw.ReadDiscard, int32(defaultDiscardPercent))
-	defaulter.LessOrEqual(&raw.WriteDiscard, int32(defaultDiscardPercent))
-
-	defaulter.LessOrEqual(&raw.WriteQueueDepth, int32(defaultWriteDepthCnt)) // $WriteChanQueCnt is equal to $WriteThreadCnt, one-to-one
-	defaulter.LessOrEqual(&raw.ReadQueueDepth, int32(defaultReadDepthCnt))
-	defaulter.LessOrEqual(&raw.DeleteQueueDepth, int32(defaultDeleteDepthCnt))
-
-	if raw.WriteQueueDepth >= MaxQueueDepth {
-		raw.WriteQueueDepth = MaxQueueDepth
-	}
-	if raw.ReadQueueDepth >= MaxQueueDepth {
-		raw.ReadQueueDepth = MaxQueueDepth
-	}
-	if raw.DeleteQueueDepth >= MaxQueueDepth {
-		raw.DeleteQueueDepth = MaxQueueDepth
-	}
-
-	// fix background, it should be the minimum
-	raw.BackgroundMBPS = fixBackgroundMBPS(raw.BackgroundMBPS, raw.WriteMBPS, raw.ReadMBPS)
+type FlowConfig struct {
+	CommonDiskConfig
+	Level LevelConfigMap `json:"level"` // every single limiter config
 }
 
-func fixBackgroundMBPS(background, writeMBPS, readMBPS int64) int64 {
-	return min(background, min(writeMBPS, readMBPS))
+type LevelFlowConfig struct {
+	BidConcurrency int64   `json:"bid_concurrency"` // limit bid concurrence
+	Concurrency    int64   `json:"concurrency"`     // limit io type concurrence
+	MBPS           int64   `json:"mbps"`            // limit MBPS concurrence
+	BusyFactor     float64 `json:"busy_factor"`     // reduce rate factor (0.0, 1.0]
+	IdleFactor     float64 `json:"idle_factor"`     // idle factor [1.0, xx)
 }
 
-func min(a, b int64) int64 {
-	if a < b {
-		return a
+func FixQosConfigOnInit(conf *Config) error {
+	return initAndFixQosConfig(conf, true)
+}
+
+func FixQosConfigHotReset(conf *Config) error {
+	return initAndFixQosConfig(conf, false)
+}
+
+// FixQosBidConcurrency special case: only ioType is read, can configure bid concurrency; other is 1
+func FixQosBidConcurrency(ioType string, concurrency int64) int64 {
+	if ioType != bnapi.ReadIO.String() {
+		return defaultBidConcurrency
 	}
-	return b
+	return concurrency
+}
+
+func initAndFixQosConfig(conf *Config, fillEmpty bool) error {
+	if conf.DiskIdleFactor > 1 {
+		return ErrQosWrongConfig
+	}
+
+	if fillEmpty {
+		defaulter.IntegerLessOrEqual(&conf.DiskIops, defaultMaxIops)
+		defaulter.IntegerLessOrEqual(&conf.DiskBandwidthMB, defaultMaxMBps)
+		defaulter.IntegerLessOrEqual(&conf.UpdateIntervalMs, defaultIntervalMs)
+		defaulter.FloatLessOrEqual(&conf.DiskIdleFactor, defaultIdleFactor)
+	}
+
+	for ioTypeStr := range conf.Level {
+		if tp := bnapi.StringToIOType(ioTypeStr); !tp.IsValid() {
+			return ErrQosWrongConfig
+		}
+	}
+
+	// if it is nil, use default
+	if conf.Level == nil {
+		conf.Level = make(LevelConfigMap)
+	}
+
+	// check each type, if it is not configure, use default
+	levelConf := make(LevelConfigMap, len(defaultConfs))
+	for ioTypeStr, defaultVal := range defaultConfs {
+		if tp := bnapi.StringToIOType(ioTypeStr); !tp.IsValid() {
+			return ErrQosWrongConfig
+		}
+
+		// if not exists, fill use default
+		userConfig, exists := conf.Level[ioTypeStr]
+		if !exists {
+			if fillEmpty {
+				levelConf[ioTypeStr] = defaultVal
+			}
+			continue
+		}
+
+		// special case: only ioType is read, can configure bid concurrency; other is 1
+		userConfig.BidConcurrency = FixQosBidConcurrency(ioTypeStr, userConfig.BidConcurrency)
+		// if exist user config, use it
+		fixedConfig, err := fixLevelFlowConfig(userConfig, defaultVal, fillEmpty)
+		if err != nil {
+			return ErrQosWrongConfig
+		}
+		levelConf[ioTypeStr] = fixedConfig
+	}
+
+	conf.Level = levelConf
+	return nil
+}
+
+func fixLevelFlowConfig(conf, defaultVal LevelFlowConfig, fillEmpty bool) (LevelFlowConfig, error) {
+	if fillEmpty {
+		defaulter.IntegerLessOrEqual(&conf.Concurrency, defaultVal.Concurrency)
+		defaulter.IntegerLessOrEqual(&conf.MBPS, defaultVal.MBPS)
+		defaulter.IntegerLessOrEqual(&conf.BidConcurrency, defaultVal.BidConcurrency)
+		defaulter.FloatLessOrEqual(&conf.BusyFactor, defaultVal.BusyFactor)
+		defaulter.FloatLessOrEqual(&conf.IdleFactor, defaultVal.IdleFactor)
+	}
+
+	if conf.BusyFactor > 1 || (conf.IdleFactor != 0 && conf.IdleFactor < 1) {
+		return LevelFlowConfig{}, ErrQosWrongConfig
+	}
+
+	return conf, nil
+}
+
+// config the qos for single/per io type
+type perIOQosConfig struct {
+	LevelFlowConfig
+	bnapi.IOType
+	lck sync.Mutex
+}
+
+func (c *CommonDiskConfig) resetDisk(conf CommonDiskConfig) {
+	if conf.DiskBandwidthMB > 0 {
+		c.DiskBandwidthMB = conf.DiskBandwidthMB
+	}
+	if conf.DiskIdleFactor > 0 && conf.DiskIdleFactor <= 1 {
+		c.DiskIdleFactor = conf.DiskIdleFactor
+	}
+	if conf.DiskIops > 0 {
+		c.DiskIops = conf.DiskIops
+	}
+}
+
+func (t *perIOQosConfig) resetLevel(conf LevelFlowConfig) {
+	t.lck.Lock()
+	defer t.lck.Unlock()
+
+	// if the config of user hot modify, is not zero, then use it
+	if conf.BidConcurrency > 0 {
+		t.LevelFlowConfig.BidConcurrency = conf.BidConcurrency
+	}
+	if conf.Concurrency > 0 {
+		t.LevelFlowConfig.Concurrency = conf.Concurrency
+	}
+	if conf.MBPS > 0 {
+		t.LevelFlowConfig.MBPS = conf.MBPS
+	}
+	if conf.BusyFactor > 0 && conf.BusyFactor <= 1 {
+		t.LevelFlowConfig.BusyFactor = conf.BusyFactor
+	}
+	if conf.IdleFactor > 0 {
+		t.LevelFlowConfig.IdleFactor = conf.IdleFactor
+	}
 }

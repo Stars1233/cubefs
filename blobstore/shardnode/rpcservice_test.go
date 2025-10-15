@@ -32,14 +32,17 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/raft"
+	"github.com/cubefs/cubefs/blobstore/common/recordlog"
 	"github.com/cubefs/cubefs/blobstore/common/rpc2"
 	"github.com/cubefs/cubefs/blobstore/common/sharding"
+	"github.com/cubefs/cubefs/blobstore/common/taskswitch"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
-	"github.com/cubefs/cubefs/blobstore/shardnode/base"
+	"github.com/cubefs/cubefs/blobstore/shardnode/blobdeleter"
 	"github.com/cubefs/cubefs/blobstore/shardnode/catalog"
 	"github.com/cubefs/cubefs/blobstore/shardnode/catalog/allocator"
-	"github.com/cubefs/cubefs/blobstore/shardnode/mock"
 	"github.com/cubefs/cubefs/blobstore/shardnode/storage"
+	"github.com/cubefs/cubefs/blobstore/testing/mocks"
+	mock "github.com/cubefs/cubefs/blobstore/testing/mockshardnode"
 	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
@@ -78,17 +81,15 @@ func genDiskID() proto.DiskID {
 }
 
 type mockServiceCfg struct {
-	tp     *base.MockTransport
+	tp     *mocks.MockTransport
 	disks  map[proto.DiskID]*storage.MockDisk
 	shards map[proto.Suid]*mock.MockSpaceShardHandler
 }
 
-func newBaseTp(t *testing.T) *base.MockTransport {
+func newBaseTp(t *testing.T) *mocks.MockTransport {
 	// transport with cm
-	tp := allocator.NewMockAllocTransport(t).(*base.MockTransport)
-	tp.EXPECT().GetAllSpaces(A).Return([]cmapi.Space{
-		testSpace,
-	}, nil).AnyTimes()
+	tp := allocator.NewMockAllocTransport(t).(*mocks.MockTransport)
+	tp.EXPECT().GetAllSpaces(A).Return([]cmapi.Space{testSpace}, nil).AnyTimes()
 	tp.EXPECT().RegisterDisk(A, A).Return(nil).AnyTimes()
 	tp.EXPECT().NodeID().Return(proto.NodeID(1)).AnyTimes()
 	return tp
@@ -96,6 +97,9 @@ func newBaseTp(t *testing.T) *base.MockTransport {
 
 func newMockService(t *testing.T, cfg mockServiceCfg) (*service, func(), error) {
 	s := &service{}
+	if cfg.tp == nil {
+		cfg.tp = newBaseTp(t)
+	}
 	s.transport = cfg.tp
 
 	s.cfg.StoreConfig.KVOption.CreateIfMissing = true
@@ -122,6 +126,38 @@ func newMockService(t *testing.T, cfg mockServiceCfg) (*service, func(), error) 
 	s.catalog = cg
 	s.taskPool = taskpool.New(1, 1)
 
+	// set mock blob delete mgr
+	cmClient := mocks.NewMockClientAPI(C(t))
+	cmClient.EXPECT().GetConfig(A, A).DoAndReturn(func(_ context.Context, name string) (string, error) {
+		return "", nil
+	}).AnyTimes()
+	taskSwitchMgr := taskswitch.NewSwitchMgr(cmClient)
+
+	sh := mock.NewMockSpaceShardHandler(C(t))
+	sh.EXPECT().ShardingSubRangeCount().Return(2).AnyTimes()
+	sh.EXPECT().InsertItem(A, A, A, A).Return(nil).AnyTimes()
+
+	sg2 := mock.NewMockDelMgrShardGetter(C(t))
+	sg2.EXPECT().GetAllShards().Return([]storage.ShardHandler{sh}).AnyTimes()
+	sg2.EXPECT().GetShard(A, A).Return(sh, nil).AnyTimes()
+
+	delLogDir, err := os.MkdirTemp(os.TempDir(), "delete_log")
+	require.NoError(t, err)
+	defer os.RemoveAll(delLogDir)
+
+	dm, _ := blobdeleter.NewBlobDeleteMgr(&blobdeleter.BlobDelMgrConfig{
+		TaskSwitchMgr: taskSwitchMgr,
+		ShardGetter:   sg2,
+		BlobDelCfg: blobdeleter.BlobDelCfg{
+			MsgChannelNum:        1,
+			MsgChannelSize:       4,
+			FailedMsgChannelSize: 4,
+			ProduceTaskPoolSize:  1,
+			DeleteLog:            recordlog.Config{Dir: delLogDir},
+		},
+	})
+	s.blobDelMgr = dm
+
 	// set disk
 	s.disks = make(map[proto.DiskID]*storage.Disk)
 	for id, d := range cfg.disks {
@@ -132,6 +168,7 @@ func newMockService(t *testing.T, cfg mockServiceCfg) (*service, func(), error) 
 		for _, d := range cfg.disks {
 			d.Close()
 		}
+		s.blobDelMgr.Close()
 	}
 
 	return s, clearFunc, nil
@@ -160,18 +197,19 @@ func newMockRpcServer(s *service, addr string) (*rpc2.Server, func()) {
 func TestRpcService_Blob(t *testing.T) {
 	// blob
 	blob := proto.Blob{
-		Name: []byte("test_get_blob"),
+		Name: "test_get_blob",
 		Location: proto.Location{
 			SliceSize: 32,
 		},
 	}
 
 	sh := mock.NewMockSpaceShardHandler(C(t))
+	sh.EXPECT().ShardingSubRangeCount().Return(2).AnyTimes()
 	sh.EXPECT().CreateBlob(A, A, A, A).Return(blob, nil).AnyTimes()
 
 	sh.EXPECT().GetBlob(A, A, A).Return(blob, nil).AnyTimes()
 
-	sh.EXPECT().DeleteBlob(A, A, A).Return(nil).AnyTimes()
+	sh.EXPECT().DeleteBlob(A, A, A, A).Return(nil).AnyTimes()
 	sh.EXPECT().UpdateBlob(A, A, A, A).Return(nil).AnyTimes()
 
 	sh.EXPECT().ListBlob(A, A, A, A, A).Return(
@@ -203,7 +241,7 @@ func TestRpcService_Blob(t *testing.T) {
 		Suid:    suid,
 	}
 	// create
-	name := []byte("test_blob")
+	name := "test_blob"
 	_, err = cli.CreateBlob(context.Background(), tcpAddrBlob, shardnode.CreateBlobArgs{
 		Header:    header,
 		Name:      name,
@@ -224,7 +262,7 @@ func TestRpcService_Blob(t *testing.T) {
 	})
 	require.Nil(t, err)
 	blob = getRet.Blob
-	require.Equal(t, []byte("test_get_blob"), blob.GetName())
+	require.Equal(t, "test_get_blob", blob.GetName())
 
 	// delete
 	err = cli.DeleteBlob(context.Background(), tcpAddrBlob, shardnode.DeleteBlobArgs{
@@ -238,7 +276,7 @@ func TestRpcService_Blob(t *testing.T) {
 		Name:   name,
 	})
 	require.Nil(t, err)
-	require.Equal(t, []byte("test_get_blob"), blob.GetName())
+	require.Equal(t, "test_get_blob", blob.GetName())
 
 	// seal
 	err = cli.SealBlob(context.Background(), tcpAddrBlob, shardnode.SealBlobArgs{
@@ -263,14 +301,27 @@ func TestRpcService_Blob(t *testing.T) {
 		Size_:    192,
 	})
 	require.Nil(t, err)
+
+	// delete blob raw
+	err = cli.DeleteBlobRaw(context.Background(), tcpAddrBlob, shardnode.DeleteBlobRawArgs{
+		Header: header,
+		Slice:  proto.Slice{Vid: proto.Vid(1), MinSliceID: proto.BlobID(123)},
+	})
+	require.Nil(t, err)
+
+	// delete blob stats
+	stats, err := cli.DeleteBlobStats(context.Background(), tcpAddrBlob, shardnode.DeleteBlobStatsArgs{})
+	require.Nil(t, err)
+	require.NotNil(t, stats)
 }
 
 func TestRpcService_Item(t *testing.T) {
 	sh := mock.NewMockSpaceShardHandler(C(t))
+	sh.EXPECT().ShardingSubRangeCount().Return(2).AnyTimes()
 	sh.EXPECT().InsertItem(A, A, A, A).Return(nil).AnyTimes()
 	// item
 	item := shardnode.Item{
-		ID: []byte("test_item"),
+		ID: "test_item",
 		Fields: []shardnode.Field{{
 			ID:    fieldsMetas[0].ID,
 			Value: []byte("value"),
@@ -311,7 +362,7 @@ func TestRpcService_Item(t *testing.T) {
 	err = cli.AddItem(context.Background(), tcpAddrItem, shardnode.InsertItemArgs{
 		Header: header,
 		Item: shardnode.Item{
-			ID: []byte("test_item"),
+			ID: "test_item",
 			Fields: []shardnode.Field{{
 				ID:    fieldsMetas[0].ID,
 				Value: []byte("value"),
@@ -327,16 +378,16 @@ func TestRpcService_Item(t *testing.T) {
 	// get
 	itm, err := cli.GetItem(context.Background(), tcpAddrItem, shardnode.GetItemArgs{
 		Header: header,
-		ID:     []byte("test_item"),
+		ID:     "test_item",
 	})
 	require.Nil(t, err)
-	require.Equal(t, []byte("test_item"), itm.GetID())
+	require.Equal(t, "test_item", itm.GetID())
 
 	// update
 	err = cli.UpdateItem(context.Background(), tcpAddrItem, shardnode.UpdateItemArgs{
 		Header: header,
 		Item: shardnode.Item{
-			ID: []byte("test_item"),
+			ID: "test_item",
 			Fields: []shardnode.Field{{
 				ID:    fieldsMetas[0].ID,
 				Value: []byte("value"),
@@ -348,7 +399,7 @@ func TestRpcService_Item(t *testing.T) {
 	// delete
 	err = cli.DeleteItem(context.Background(), tcpAddrItem, shardnode.DeleteItemArgs{
 		Header: header,
-		ID:     []byte("test_item"),
+		ID:     "test_item",
 	})
 	require.Nil(t, err)
 

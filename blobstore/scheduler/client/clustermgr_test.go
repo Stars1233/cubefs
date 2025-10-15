@@ -14,8 +14,6 @@
 
 package client
 
-//go:generate mockgen -destination=./clustermgr_mock_test.go -package=client -mock_names IClusterManager=MockClusterManager github.com/cubefs/cubefs/blobstore/scheduler/client IClusterManager
-
 import (
 	"context"
 	"encoding/json"
@@ -106,21 +104,21 @@ func TestClustermgrClient(t *testing.T) {
 	{
 		// lock volume
 		cli.client.(*MockClusterManager).EXPECT().LockVolume(any, any).Return(nil)
-		err := cli.LockVolume(ctx, 1)
+		err := cli.LockVolume(ctx, 1, 0)
 		require.NoError(t, err)
 	}
 	{
 		// unlock volume
 		cli.client.(*MockClusterManager).EXPECT().UnlockVolume(any, any).Return(nil)
-		err := cli.UnlockVolume(ctx, 1)
+		err := cli.UnlockVolume(ctx, 1, 0)
 		require.NoError(t, err)
 
 		cli.client.(*MockClusterManager).EXPECT().UnlockVolume(any, any).Return(errcode.ErrUnlockNotAllow)
-		err = cli.UnlockVolume(ctx, 1)
-		require.ErrorIs(t, errcode.ErrUnlockNotAllow, err)
+		err = cli.UnlockVolume(ctx, 1, 0)
+		require.ErrorIs(t, err, errcode.ErrUnlockNotAllow)
 
 		cli.client.(*MockClusterManager).EXPECT().UnlockVolume(any, any).Return(errMock)
-		err = cli.UnlockVolume(ctx, 1)
+		err = cli.UnlockVolume(ctx, 1, 0)
 		require.True(t, errors.Is(err, errMock))
 	}
 	{

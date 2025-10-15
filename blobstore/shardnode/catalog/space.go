@@ -27,6 +27,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/security"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/shardnode/catalog/allocator"
+	snproto "github.com/cubefs/cubefs/blobstore/shardnode/proto"
 	"github.com/cubefs/cubefs/blobstore/shardnode/storage"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 )
@@ -103,8 +104,8 @@ func (s *Space) InsertItem(ctx context.Context, h shardnode.ShardOpHeader, i sha
 
 	return shard.InsertItem(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpaceKey(i.ID), i)
+		ShardKeys:    shardnode.DecodeShardKeys(i.ID, shard.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(i.ID)), i)
 }
 
 func (s *Space) UpdateItem(ctx context.Context, h shardnode.ShardOpHeader, i shardnode.Item) error {
@@ -118,11 +119,11 @@ func (s *Space) UpdateItem(ctx context.Context, h shardnode.ShardOpHeader, i sha
 
 	return shard.UpdateItem(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpaceKey(i.ID), i)
+		ShardKeys:    shardnode.DecodeShardKeys(i.ID, shard.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(i.ID)), i)
 }
 
-func (s *Space) DeleteItem(ctx context.Context, h shardnode.ShardOpHeader, id []byte) error {
+func (s *Space) DeleteItem(ctx context.Context, h shardnode.ShardOpHeader, id string) error {
 	shard, err := s.shardGetter.GetShard(h.DiskID, h.Suid)
 	if err != nil {
 		return err
@@ -130,11 +131,11 @@ func (s *Space) DeleteItem(ctx context.Context, h shardnode.ShardOpHeader, id []
 
 	return shard.DeleteItem(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpaceKey(id))
+		ShardKeys:    shardnode.DecodeShardKeys(id, shard.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(id)))
 }
 
-func (s *Space) GetItem(ctx context.Context, h shardnode.ShardOpHeader, id []byte) (shardnode.Item, error) {
+func (s *Space) GetItem(ctx context.Context, h shardnode.ShardOpHeader, id string) (shardnode.Item, error) {
 	shard, err := s.shardGetter.GetShard(h.DiskID, h.Suid)
 	if err != nil {
 		return shardnode.Item{}, err
@@ -142,31 +143,30 @@ func (s *Space) GetItem(ctx context.Context, h shardnode.ShardOpHeader, id []byt
 
 	return shard.GetItem(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpaceKey(id))
+		ShardKeys:    shardnode.DecodeShardKeys(id, shard.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(id)))
 }
 
-func (s *Space) ListItem(ctx context.Context, h shardnode.ShardOpHeader, prefix, marker []byte, count uint64) ([]shardnode.Item, []byte, error) {
+func (s *Space) ListItem(ctx context.Context, h shardnode.ShardOpHeader, prefix, marker string, count uint64) ([]shardnode.Item, string, error) {
 	shard, err := s.shardGetter.GetShard(h.DiskID, h.Suid)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
 
 	var _marker []byte
 	if len(marker) > 0 {
-		_marker = s.generateSpaceKey(marker)
+		_marker = s.generateSpaceKey([]byte(marker))
 	}
 	items, nextMarker, err := shard.ListItem(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpacePrefix(prefix), _marker, count)
+	}, s.generateSpacePrefix([]byte(prefix)), _marker, count)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
 	if len(nextMarker) > 0 {
 		nextMarker = s.decodeSpaceKey(nextMarker)
 	}
-	return items, nextMarker, nil
+	return items, string(nextMarker), nil
 }
 
 func (s *Space) CreateBlob(ctx context.Context, req *shardnode.CreateBlobArgs) (resp shardnode.CreateBlobRet, err error) {
@@ -227,8 +227,8 @@ INSERT:
 	start = time.Now()
 	cb, _err := sd.CreateBlob(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpaceKey(req.Name), b)
+		ShardKeys:    shardnode.DecodeShardKeys(req.Name, sd.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(req.Name)), b)
 	span.AppendTrackLog(opInsert, start, _err, trace.OptSpanDurationUs())
 	if _err != nil {
 		err = errors.Info(_err, "insert kv failed")
@@ -260,7 +260,7 @@ func (s *Space) GetBlob(ctx context.Context, req *shardnode.GetBlobArgs) (resp s
 	return
 }
 
-func (s *Space) DeleteBlob(ctx context.Context, req *shardnode.DeleteBlobArgs) error {
+func (s *Space) DeleteBlob(ctx context.Context, req *shardnode.DeleteBlobArgs, items []shardnode.Item) error {
 	span := trace.SpanFromContextSafe(ctx)
 	span.SetTag(blobTraceTag, string(req.Name))
 
@@ -273,35 +273,10 @@ func (s *Space) DeleteBlob(ctx context.Context, req *shardnode.DeleteBlobArgs) e
 	start := time.Now()
 	err = sd.DeleteBlob(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpaceKey(req.Name))
+		ShardKeys:    shardnode.DecodeShardKeys(req.Name, sd.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(req.Name)), items)
 	span.AppendTrackLog(opDelete, start, err, trace.OptSpanDurationUs())
 	return err
-}
-
-func (s *Space) FindAndDeleteBlob(ctx context.Context, req *shardnode.DeleteBlobArgs) (resp shardnode.GetBlobRet, err error) {
-	span := trace.SpanFromContextSafe(ctx)
-	span.SetTag(blobTraceTag, string(req.Name))
-
-	h := req.Header
-	sd, err := s.shardGetter.GetShard(h.DiskID, h.Suid)
-	if err != nil {
-		return
-	}
-
-	blob, err := s.getBlob(ctx, sd, req.Header, req.Name)
-	if err != nil {
-		return
-	}
-	resp.Blob = blob
-
-	start := time.Now()
-	err = sd.DeleteBlob(ctx, storage.OpHeader{
-		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpaceKey(req.Name))
-	span.AppendTrackLog(opDelete, start, err, trace.OptSpanDurationUs())
-	return
 }
 
 func (s *Space) SealBlob(ctx context.Context, req *shardnode.SealBlobArgs) (err error) {
@@ -313,8 +288,6 @@ func (s *Space) SealBlob(ctx context.Context, req *shardnode.SealBlobArgs) (err 
 	if err != nil {
 		return err
 	}
-
-	key := s.generateSpaceKey(req.Name)
 
 	b, err := s.getBlob(ctx, sd, req.Header, req.Name)
 	if err != nil {
@@ -395,8 +368,8 @@ func (s *Space) SealBlob(ctx context.Context, req *shardnode.SealBlobArgs) (err 
 	start := time.Now()
 	err = sd.UpdateBlob(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, key, b)
+		ShardKeys:    shardnode.DecodeShardKeys(req.Name, sd.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(req.Name)), b)
 	span.AppendTrackLog(opUpdate, start, err, trace.OptSpanDurationUs())
 	if err != nil {
 		err = errors.Info(err, "update kv failed")
@@ -405,7 +378,7 @@ func (s *Space) SealBlob(ctx context.Context, req *shardnode.SealBlobArgs) (err 
 	return nil
 }
 
-func (s *Space) ListBlob(ctx context.Context, h shardnode.ShardOpHeader, prefix, marker []byte, count uint64) (blobs []proto.Blob, nextMarker []byte, err error) {
+func (s *Space) ListBlob(ctx context.Context, h shardnode.ShardOpHeader, prefix, marker string, count uint64) (blobs []proto.Blob, nextMarker string, err error) {
 	shard, err := s.shardGetter.GetShard(h.DiskID, h.Suid)
 	if err != nil {
 		return
@@ -413,21 +386,20 @@ func (s *Space) ListBlob(ctx context.Context, h shardnode.ShardOpHeader, prefix,
 
 	var _marker []byte
 	if len(marker) > 0 {
-		_marker = s.generateSpaceKey(marker)
+		_marker = s.generateSpaceKey([]byte(marker))
 	}
 
-	blobs, nextMarker, err = shard.ListBlob(ctx, storage.OpHeader{
+	blobs, bytesNextMarker, err := shard.ListBlob(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, s.generateSpacePrefix(prefix), _marker, count)
+	}, s.generateSpacePrefix([]byte(prefix)), _marker, count)
 	if err != nil {
 		err = errors.Info(err, "shard list blob failed")
-		return nil, nil, err
+		return nil, "", err
 	}
-	if len(nextMarker) > 0 {
-		nextMarker = s.decodeSpaceKey(nextMarker)
+	if len(bytesNextMarker) > 0 {
+		bytesNextMarker = s.decodeSpaceKey(bytesNextMarker)
 	}
-	return blobs, nextMarker, nil
+	return blobs, string(bytesNextMarker), nil
 }
 
 func (s *Space) AllocSlice(ctx context.Context, req *shardnode.AllocSliceArgs) (resp shardnode.AllocSliceRet, err error) {
@@ -439,8 +411,6 @@ func (s *Space) AllocSlice(ctx context.Context, req *shardnode.AllocSliceArgs) (
 	if err != nil {
 		return
 	}
-
-	key := s.generateSpaceKey(req.Name)
 
 	getBlobRet, err := s.GetBlob(ctx, &shardnode.GetBlobArgs{
 		Header: req.Header,
@@ -522,8 +492,8 @@ func (s *Space) AllocSlice(ctx context.Context, req *shardnode.AllocSliceArgs) (
 	start = time.Now()
 	err = sd.UpdateBlob(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
-	}, key, b)
+		ShardKeys:    shardnode.DecodeShardKeys(req.Name, sd.ShardingSubRangeCount()),
+	}, s.generateSpaceKey([]byte(req.Name)), b)
 	span.AppendTrackLog(opUpdate, start, err, trace.OptSpanDurationUs())
 	if err != nil {
 		err = errors.Info(err, "update kv failed")
@@ -533,14 +503,22 @@ func (s *Space) AllocSlice(ctx context.Context, req *shardnode.AllocSliceArgs) (
 	return
 }
 
-func (s *Space) getBlob(ctx context.Context, sd storage.ShardHandler, h shardnode.ShardOpHeader, name []byte) (b proto.Blob, err error) {
+func (s *Space) GetShardingSubRangeCount(diskID proto.DiskID, suid proto.Suid) (int, error) {
+	sd, err := s.shardGetter.GetShard(diskID, suid)
+	if err != nil {
+		return -1, err
+	}
+	return sd.ShardingSubRangeCount(), nil
+}
+
+func (s *Space) getBlob(ctx context.Context, sd storage.ShardHandler, h shardnode.ShardOpHeader, name string) (b proto.Blob, err error) {
 	span := trace.SpanFromContextSafe(ctx)
-	key := s.generateSpaceKey(name)
+	key := s.generateSpaceKey([]byte(name))
 
 	start := time.Now()
 	b, err = sd.GetBlob(ctx, storage.OpHeader{
 		RouteVersion: h.RouteVersion,
-		ShardKeys:    h.ShardKeys,
+		ShardKeys:    shardnode.DecodeShardKeys(name, sd.ShardingSubRangeCount()),
 	}, key)
 
 	withErr := err
@@ -568,51 +546,60 @@ func (s *Space) validateFields(fields []shardnode.Field) bool {
 func (s *Space) generateSpaceKey(id []byte) []byte {
 	// todo: reuse with memory pool
 	spaceKeyLen, paddingLen := s.generateSpaceKeyLen(id)
-	dest := make([]byte, spaceKeyLen+8) // Add 8 bytes for paddingLen
-	binary.BigEndian.PutUint64(dest, uint64(s.sid))
+	dest := make([]byte, spaceKeyLen)
+	// put prefix first
+	copy(dest, snproto.SpaceDataPrefix)
+
+	index := 1
+	binary.BigEndian.PutUint64(dest[index:], uint64(s.sid))
+	index += 8
 
 	// align id with 8 bytes padding
 	idLen := len(id)
-	copy(dest[8:], id)
+	copy(dest[index:], id)
+	index += idLen
 	for i := 0; i < paddingLen; i++ {
-		dest[8+idLen+i] = 0 // Padding with 0s
+		dest[index+i] = 0 // Padding with 0s
 	}
+	index += paddingLen
+
 	// big endian encode and reverse
 	// latest space version item will store in front of oldest. eg:
 	// sid-id-3
 	// sid-id-2
 	// sid-id-1
-	versionIdx := 8 + idLen + paddingLen
-	binary.BigEndian.PutUint64(dest[versionIdx:], s.spaceVersion)
+	binary.BigEndian.PutUint64(dest[index:], s.spaceVersion)
 	for i := 0; i < 8; i++ {
-		dest[versionIdx+i] = ^dest[versionIdx+i]
+		dest[index+i] = ^dest[index+i]
 	}
+	index += 8
 	// Record paddingLen in the last 8 bytes
-	binary.BigEndian.PutUint64(dest[spaceKeyLen:], uint64(paddingLen))
+	binary.BigEndian.PutUint64(dest[index:], uint64(paddingLen))
 	return dest
 }
 
 func (s *Space) generateSpacePrefix(prefix []byte) []byte {
 	dest := make([]byte, s.generateSpacePrefixLen(prefix))
-	binary.BigEndian.PutUint64(dest, uint64(s.sid))
-	copy(dest[8:], prefix)
+	copy(dest, snproto.SpaceDataPrefix)
+
+	binary.BigEndian.PutUint64(dest[1:], uint64(s.sid))
+	copy(dest[9:], prefix)
 	return dest
 }
 
 func (s *Space) decodeSpaceKey(key []byte) []byte {
-	if len(key) < 24 {
+	if len(key) < 25 {
 		panic(fmt.Sprintf("decode illegal space key: %+v", key))
 	}
 	// extract paddingLen from the last 8 bytes
 	paddingLen := int(binary.BigEndian.Uint64(key[len(key)-8:]))
-
 	// calculate the total length of id and padding
-	totalIdLen := len(key) - 16 - 8
+	totalIdLen := len(key) - 16 - 8 - 1
 	if totalIdLen < 0 {
 		return nil
 	}
 	// extract id and padding
-	idWithPadding := key[8 : 8+totalIdLen]
+	idWithPadding := key[9 : 9+totalIdLen]
 
 	// remove padding to get the original id
 	return idWithPadding[:totalIdLen-paddingLen]
@@ -621,11 +608,12 @@ func (s *Space) decodeSpaceKey(key []byte) []byte {
 func (s *Space) generateSpaceKeyLen(id []byte) (int, int) {
 	idLen := len(id)
 	paddingLen := (8 - (idLen % 8)) % 8
-	return 8 + len(id) + 8 + paddingLen, paddingLen
+	// prefix[1] + spaceId[8] + len(id) + len(padding) + spaceVersion[8] + paddingLen[8]
+	return 1 + 8 + len(id) + paddingLen + 8 + 8, paddingLen
 }
 
 func (s *Space) generateSpacePrefixLen(prefix []byte) int {
-	return 8 + len(prefix)
+	return 1 + 8 + len(prefix)
 }
 
 func isEmptySlice(s proto.Slice) bool {

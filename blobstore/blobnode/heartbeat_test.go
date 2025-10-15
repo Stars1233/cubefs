@@ -33,6 +33,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	"github.com/cubefs/cubefs/blobstore/blobnode/db"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
+	"github.com/cubefs/cubefs/blobstore/common/recordlog"
 )
 
 func TestHeartbeat(t *testing.T) {
@@ -67,6 +68,9 @@ func TestHeartbeat2(t *testing.T) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
+		if implementExtendCodemode(w, req) {
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -97,6 +101,7 @@ func TestHeartbeat2(t *testing.T) {
 		},
 		Clustermgr:           cc,
 		HeartbeatIntervalSec: 1,
+		InspectConf:          DataInspectConf{Record: recordlog.Config{Dir: filepath.Join(workDir, "inspect")}},
 	}
 	service, err := NewService(conf)
 	require.NoError(t, err)
@@ -133,6 +138,9 @@ func TestHeartbeat3(t *testing.T) {
 			_, _ = w.Write(b)
 			return
 		}
+		if implementExtendCodemode(w, req) {
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -167,6 +175,7 @@ func TestHeartbeat3(t *testing.T) {
 		},
 		Clustermgr:           cc,
 		HeartbeatIntervalSec: 600,
+		InspectConf:          DataInspectConf{Record: recordlog.Config{Dir: filepath.Join(workDir, "inspect")}},
 	}
 	service, err := NewService(conf)
 	require.NoError(t, err)

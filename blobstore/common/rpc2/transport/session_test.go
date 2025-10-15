@@ -241,7 +241,7 @@ func TestSpeed(t *testing.T) {
 }
 
 func TestSizedReadWrite(t *testing.T) {
-	const k64 = 64 * (1 << 10)
+	const k64 = 64 << 10
 	_, stop, cli, err := setupServer(t)
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +249,7 @@ func TestSizedReadWrite(t *testing.T) {
 	defer stop()
 	session, _ := Client(cli, nil)
 	stream, _ := session.OpenStream()
-	stream.frameSize = k64 // payload k64 - headerSize
+	stream.frameSize = k64 // payload k64
 
 	{
 		size := k64 / 2
@@ -275,7 +275,7 @@ func TestSizedReadWrite(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if n != k64-headerSize {
+		if n != k64 {
 			t.Fatal("error frame size", n)
 		}
 		if rc.Finished() {
@@ -361,6 +361,142 @@ func TestSizedReadWriteContext(t *testing.T) {
 		t.Fatal("read canceled context")
 	}
 	cancel()
+	session.Close()
+}
+
+type continueFrameReader struct {
+	sized []int
+	err   error
+}
+
+func (r *continueFrameReader) size() (sum int) {
+	for _, size := range r.sized {
+		sum += size
+	}
+	return
+}
+
+func (r *continueFrameReader) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	if len(r.sized) == 0 {
+		return 0, io.EOF
+	}
+	n = r.sized[0]
+	r.sized = r.sized[1:]
+	_ = p[:n]
+	return n, ErrFrameContinue
+}
+
+func TestSizedWriteError(t *testing.T) {
+	_, stop, cli, err := setupServer(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	session, _ := Client(cli, nil)
+	stream, _ := session.OpenStream()
+
+	sized := []int{1, 2, 3, 8, 31, 64, 1 << 8}
+	r := &continueFrameReader{sized: sized, err: ErrFrameOdd}
+	if _, err = stream.SizedWrite(testCtx, r, r.size()); err != ErrFrameOdd {
+		t.Fatal("write error")
+	}
+	session.Close()
+}
+
+func TestSizedWriteContinue(t *testing.T) {
+	_, stop, cli, err := setupServer(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	session, _ := Client(cli, nil)
+	stream, _ := session.OpenStream()
+
+	sized := []int{1, 2, 3, 8, 31, 64, 1 << 8}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		var fr *FrameRead
+		for _, size := range sized {
+			fr, err = stream.ReadFrame(testCtx)
+			if err != nil {
+				t.Error(err)
+			}
+			_, err = io.ReadFull(fr, make([]byte, size))
+			fr.Close()
+			if err != nil {
+				t.Error(err)
+			}
+		}
+		stream.Close()
+		wg.Done()
+	}()
+
+	r := &continueFrameReader{sized: sized}
+	if _, err = stream.SizedWrite(testCtx, r, r.size()); err != nil {
+		t.Fatal("write continue")
+	}
+	wg.Wait()
+	session.Close()
+}
+
+func TestSizedWriteRange(t *testing.T) {
+	_, stop, cli, err := setupServer(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	session, _ := Client(cli, nil)
+	stream, _ := session.OpenStream()
+
+	size := (4 << 20) + 11
+	buff := make([]byte, size)
+	crand.Read(buff)
+
+	run := func(head, tail int) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if head+tail == size {
+				return
+			}
+			buf := make([]byte, size-head-tail)
+			r := stream.NewSizedReader(testCtx, len(buf), nil)
+			_, errx := io.ReadFull(r, buf)
+			if errx != nil {
+				t.Error(errx)
+			}
+			if !bytes.Equal(buf, buff[head:head+len(buf)]) {
+				t.Fail()
+			}
+		}()
+		var cbbuf []byte
+		if _, err = stream.RangedWrite(testCtx, bytes.NewReader(buff),
+			size, head, tail, true, func(data []byte) error {
+				cbbuf = append(cbbuf, data...)
+				return nil
+			}); err != nil {
+			t.Fatal("write range")
+		}
+		if !bytes.Equal(cbbuf, buff[head:head+len(cbbuf)]) {
+			t.Fail()
+		}
+		wg.Wait()
+	}
+
+	run(0, 0)
+	run(size, 0)
+	run(size-1, 0)
+	run(size-1, 1)
+	run(0, size-1)
+	run(1, size-1)
+	for range [1000]struct{}{} {
+		run(rand.Intn(size/2), rand.Intn(size/2))
+	}
 	session.Close()
 }
 
@@ -834,6 +970,7 @@ func TestRandomFrame(t *testing.T) {
 		rnd := int(rand.Uint32()%1024) + 1
 		buffer, _ := defaultAllocator.Alloc(rnd)
 		io.ReadFull(crand.Reader, buffer.Bytes())
+		buffer.Written(headerSize)
 		buffer.Written(rnd)
 		session.conn.WriteBuffer(buffer)
 	}
@@ -896,16 +1033,16 @@ func TestRandomFrame(t *testing.T) {
 	}
 	session, _ = Client(newConn(cli), nil)
 
-	rnd := make([]byte, rand.Uint32()%1024)
+	rnd := make([]byte, 1+rand.Uint32()%1024)
 	io.ReadFull(crand.Reader, rnd)
 	f, _ := session.newFrameWrite(byte(rand.Uint32()), rand.Uint32(), len(rnd))
 	f.Write(rnd)
 
-	buffer, _ := defaultAllocator.Alloc(headerSize + len(f.data))
+	buffer, _ := defaultAllocator.Alloc(len(rnd))
 	buf := buffer.Bytes()
 
 	first := (uint32(f.ver) << 28) | (uint32(f.cmd&0x0f) << 24) |
-		(uint32(f.Len()+1) & 0xffffff)
+		(uint32(len(rnd)+1) & 0xffffff)
 	binary.LittleEndian.PutUint32(buf[:], first) // incorrect size
 	binary.LittleEndian.PutUint32(buf[4:], f.sid)
 	copy(buf[headerSize:], rnd)
@@ -940,6 +1077,7 @@ func TestWriteFrameInternal(t *testing.T) {
 		rnd := int(rand.Uint32()%1024) + 1
 		buffer, _ := defaultAllocator.Alloc(rnd)
 		io.ReadFull(crand.Reader, buffer.Bytes())
+		buffer.Written(headerSize)
 		buffer.Written(rnd)
 		session.conn.WriteBuffer(buffer)
 	}
@@ -955,11 +1093,9 @@ func TestWriteFrameInternal(t *testing.T) {
 	session.Close()
 	for i := 0; i < 100; i++ {
 		f, _ := session.newFrameWrite(byte(rand.Uint32()), rand.Uint32(), 0)
-		deadline := writeDealine{
-			time: time.Now().Add(session.config.KeepAliveTimeout),
-			wait: time.After(session.config.KeepAliveTimeout),
-		}
-		session.writeFrameInternal(f, deadline, CLSDATA)
+		session.writeFrameInternal(f, CLSDATA,
+			time.Now().Add(session.config.KeepAliveTimeout),
+			time.After(session.config.KeepAliveTimeout))
 	}
 
 	// random cmds
@@ -971,18 +1107,16 @@ func TestWriteFrameInternal(t *testing.T) {
 	session, _ = Client(newConn(cli), nil)
 	for i := 0; i < 100; i++ {
 		f, _ := session.newFrameWrite(allcmds[rand.Int()%len(allcmds)], rand.Uint32(), 0)
-		deadline := writeDealine{
-			time: time.Now().Add(session.config.KeepAliveTimeout),
-			wait: time.After(session.config.KeepAliveTimeout),
-		}
-		session.writeFrameInternal(f, deadline, CLSDATA)
+		session.writeFrameInternal(f, CLSDATA,
+			time.Now().Add(session.config.KeepAliveTimeout),
+			time.After(session.config.KeepAliveTimeout))
 	}
 	// deadline occur
 	{
 		c := make(chan time.Time)
 		close(c)
 		f, _ := session.newFrameWrite(allcmds[rand.Int()%len(allcmds)], rand.Uint32(), 0)
-		_, err = session.writeFrameInternal(f, writeDealine{wait: c}, CLSDATA)
+		_, err = session.writeFrameInternal(f, CLSDATA, time.Time{}, c)
 		if !strings.Contains(err.Error(), "timeout") {
 			t.Fatal("write frame with deadline failed", err)
 		}
@@ -1007,7 +1141,7 @@ func TestWriteFrameInternal(t *testing.T) {
 			time.Sleep(time.Second)
 			close(c)
 		}()
-		_, err = session.writeFrameInternal(f, writeDealine{wait: c}, CLSDATA)
+		_, err = session.writeFrameInternal(f, CLSDATA, time.Time{}, c)
 		if !strings.Contains(err.Error(), "closed pipe") {
 			t.Fatal("write frame with to closed conn failed", err)
 		}
@@ -1296,6 +1430,51 @@ func bench(b *testing.B, rd io.Reader, wr io.Writer) {
 	}()
 	for i := 0; i < b.N; i++ {
 		wr.Write(buf)
+	}
+	wg.Wait()
+}
+
+func BenchmarkRangedWrite(b *testing.B) {
+	cs, ss, err := getSmuxStreamPair(false)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cs.Close()
+	defer ss.Close()
+
+	const size = (2 * 1024)
+
+	buf := make([]byte, size)
+	cr := bytes.NewReader(buf)
+	b.SetBytes(size)
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetParallelism(1)
+	runtime.GC()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		count := 0
+		for {
+			ss.SetReadDeadline(time.Now().Add(time.Minute))
+			sr := ss.NewSizedReader(testCtx, size-20, nil)
+			n, err := sr.WriteTo(io.Discard)
+			sr.Close()
+			if err != nil {
+				panic(err)
+			}
+			count += int(n)
+			if count == (size-20)*b.N {
+				return
+			}
+		}
+	}()
+	for i := 0; i < b.N; i++ {
+		cr.Reset(buf)
+		cs.SetWriteDeadline(time.Now().Add(time.Minute))
+		cs.RangedWrite(testCtx, cr, size, 10, 10, false, nil)
 	}
 	wg.Wait()
 }

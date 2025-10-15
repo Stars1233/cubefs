@@ -24,8 +24,6 @@ import (
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/blobnode/base"
-	"github.com/cubefs/cubefs/blobstore/blobnode/base/limitio"
-	"github.com/cubefs/cubefs/blobstore/blobnode/base/qos"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	"github.com/cubefs/cubefs/blobstore/common/crc32block"
 	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
@@ -80,11 +78,6 @@ func (s *Service) ShardGet(c *rpc.Context) {
 		return
 	}
 
-	// set io type
-	convertIoType(&args.Type) // For compatibility with previous versions io type
-	ctx = bnapi.SetIoType(ctx, args.Type)
-	ctx = limitio.SetLimitTrack(ctx)
-
 	s.lock.RLock()
 	ds, exist := s.Disks[args.DiskID]
 	s.lock.RUnlock()
@@ -104,12 +97,26 @@ func (s *Service) ShardGet(c *rpc.Context) {
 		return
 	}
 
-	qosLmt := ds.GetIoQos()
-	if !qosLmt.TryAcquireIO(ctx, uint64(args.Vuid), qos.IOTypeRead) {
-		c.RespondError(bloberr.ErrOverload)
+	// set io type
+	convertOldIOType(&args.Type)
+	ctx = bnapi.SetIoType(ctx, args.Type)
+	qosLmt, exist := ds.GetIoQos().GetQueueQos(ctx)
+	if !exist {
+		span.Errorf("fail to get qos mgr, disk:%d", cs.Disk().ID())
+		c.RespondError(bloberr.ErrInternal)
 		return
 	}
-	defer qosLmt.ReleaseIO(uint64(args.Vuid), qos.IOTypeRead)
+
+	if err = qosLmt.AcquireBid(uint64(args.Bid)); err != nil {
+		c.RespondError(err)
+		return
+	}
+	defer qosLmt.ReleaseBid(uint64(args.Bid))
+	if err = qosLmt.Acquire(); err != nil {
+		c.RespondError(err)
+		return
+	}
+	defer qosLmt.Release()
 
 	// build shard reader
 	shard := core.NewShardReader(args.Bid, args.Vuid, from, to, w)
@@ -154,7 +161,7 @@ func (s *Service) ShardGet(c *rpc.Context) {
 	if err != nil {
 		span.Errorf("Failed read. args:%v err:%v, written:%v", args, err, written)
 		if isShardErr(err) {
-			s.inspectMgr.reportBadShard(cs, args.Bid, err)
+			s.inspectMgr.reportBadShard(ctx, cs, args.Bid, err)
 		}
 		if !wroteHeader {
 			err = handlerBidNotFoundErr(err)
@@ -163,6 +170,86 @@ func (s *Service) ShardGet(c *rpc.Context) {
 		return
 	}
 
+	s.reportGetTraffic(args.Type, written)
+}
+
+func (s *Service) ShardsGet(c *rpc.Context) {
+	args := new(bnapi.GetShardsArgs)
+	if err := c.ParseArgs(args); err != nil {
+		c.RespondError(err)
+		return
+	}
+	ctx, w := c.Request.Context(), c.Writer
+	span := trace.SpanFromContextSafe(ctx)
+
+	if !bnapi.IsValidDiskID(args.DiskID) {
+		c.RespondError(bloberr.ErrInvalidDiskId)
+		return
+	}
+	if !args.Type.IsValid() {
+		c.RespondError(bloberr.ErrInvalidParam)
+		return
+	}
+	var (
+		written     int64
+		wroteHeader bool
+	)
+
+	// set io type
+	convertOldIOType(&args.Type)
+	ctx = bnapi.SetIoType(ctx, args.Type)
+
+	s.lock.RLock()
+	ds, exist := s.Disks[args.DiskID]
+	s.lock.RUnlock()
+	if !exist {
+		c.RespondError(bloberr.ErrNoSuchDisk)
+		return
+	}
+
+	if !ds.IsWritable() { // not normal disk, skip
+		c.RespondError(bloberr.ErrDiskBroken)
+		return
+	}
+
+	cs, exist := ds.GetChunkStorage(args.Vuid)
+	if !exist {
+		c.RespondError(bloberr.ErrNoSuchVuid)
+		return
+	}
+
+	// build shard reader
+	shard, err := core.NewBatchShardReader(args.Bids, args.Vuid, w, ds.GetConfig().BatchBufferSize)
+	if err != nil {
+		c.RespondError(err)
+		return
+	}
+
+	shard.PrepareHook = func(shard *core.BatchShard) {
+		// build http response header
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Transfer-Encoding", "binary")
+
+		bodySize := shard.Size
+
+		w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+		c.RespondStatus(http.StatusOK)
+
+		wroteHeader = true
+
+		// flush header, First byte optimization
+		c.Flush()
+	}
+
+	written, err = cs.BatchRead(ctx, shard)
+	if err != nil {
+		span.Errorf("Failed batch read. args:%v err:%v, written:%v", args, err, written)
+		if !wroteHeader {
+			err = handlerBidNotFoundErr(err)
+			c.RespondError(err)
+		}
+		return
+	}
 	s.reportGetTraffic(args.Type, written)
 }
 
@@ -204,16 +291,21 @@ func (s *Service) ShardList(c *rpc.Context) {
 		return
 	}
 
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
+		return
+	}
+
 	cs, exist := ds.GetChunkStorage(args.Vuid)
 	if !exist {
-		span.Errorf("vuid:%v not exist", args.Vuid)
+		span.Errorf("vuid:%d not exist, diskID:%d", args.Vuid, args.DiskID)
 		c.RespondError(bloberr.ErrNoSuchVuid)
 		return
 	}
 
 	sis, next, err := cs.ListShards(ctx, args.StartBid, args.Count, args.Status)
 	if err != nil {
-		span.Errorf("Failed list shard. err:%v", err)
+		span.Errorf("Failed list shard. args:%+v err:%v", args, err)
 		c.RespondError(err)
 		return
 	}
@@ -226,7 +318,7 @@ func (s *Service) ShardList(c *rpc.Context) {
 
 /*
  *  method:         GET
- *  url:            /shard/stat/diskid/{diskid}/vuid/{vuidValue}/bid/{bidValue}
+ *  url:            /shard/stat/diskid/{diskid}/vuid/{vuidValue}/bid/{bidValue}?iotype={iotype}
  *  response body:  json.Marshal(ShardMeta)
  */
 func (s *Service) ShardStat(c *rpc.Context) {
@@ -253,6 +345,11 @@ func (s *Service) ShardStat(c *rpc.Context) {
 		return
 	}
 
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
+		return
+	}
+
 	cs, exist := ds.GetChunkStorage(args.Vuid)
 	if !exist {
 		span.Errorf("vuid<%d> not exist.args: %v", args.Vuid, args)
@@ -260,10 +357,24 @@ func (s *Service) ShardStat(c *rpc.Context) {
 		return
 	}
 
+	convertOldIOType(&args.Type)
+	ctx = bnapi.SetIoType(ctx, args.Type)
+	qosLmt, exist := ds.GetIoQos().GetQueueQos(ctx)
+	if !exist {
+		span.Errorf("fail to get qos mgr, disk:%d", cs.Disk().ID())
+		c.RespondError(bloberr.ErrInternal)
+		return
+	}
+	if err := qosLmt.Acquire(); err != nil {
+		c.RespondError(err)
+		return
+	}
+	defer qosLmt.Release()
+
 	sm, err := cs.ReadShardMeta(ctx, args.Bid)
 	if err != nil {
 		err = handlerBidNotFoundErr(err)
-		span.Errorf("Failed Get stat bid: %d, err:%v", args.Bid, err)
+		span.Errorf("Failed Get stat: args:%+v, err:%v", args, err)
 		c.RespondError(err)
 		return
 	}
@@ -275,6 +386,9 @@ func (s *Service) ShardStat(c *rpc.Context) {
 		Crc:    sm.Crc,
 		Flag:   sm.Flag,
 		Inline: sm.Inline,
+		Offset: sm.Offset,
+
+		NopData: sm.NopData,
 	}
 	c.RespondJSON(stat)
 }
@@ -318,46 +432,30 @@ func (s *Service) ShardMarkdelete(c *rpc.Context) {
 		return
 	}
 
-	limitKey := args.Bid
-	err := s.DeleteQpsLimitPerKey.Acquire(limitKey)
-	if err != nil {
-		span.Warnf("Shard mark delete concurrency key. key:%s", limitKey)
-		c.RespondError(bloberr.ErrOverload)
+	ctx = bnapi.SetIoType(ctx, bnapi.DeleteIO)
+	qosLmt, exist := ds.GetIoQos().GetQueueQos(ctx)
+	if !exist {
+		span.Errorf("fail to get qos mgr, disk:%d", cs.Disk().ID())
+		c.RespondError(bloberr.ErrInternal)
 		return
 	}
-	defer s.DeleteQpsLimitPerKey.Release(limitKey)
 
-	perDiskLimitKey := cs.Disk().ID()
-	err = s.DeleteQpsLimitPerDisk.Acquire(perDiskLimitKey)
-	if err != nil {
-		span.Warnf("Shard mark delete overload perdisk. key:%d", cs.Disk().ID())
-		c.RespondError(bloberr.ErrOverload)
-		return
-	}
-	defer s.DeleteQpsLimitPerDisk.Release(perDiskLimitKey)
-
-	qosLmt := ds.GetIoQos() // max io wait
-	if !qosLmt.TryAllow(qos.IOTypeDel) {
-		c.RespondError(bloberr.ErrOverload)
-		return
-	}
-	defer qosLmt.Release(qos.IOTypeDel)
-
-	err = cs.AllowModify()
-	if err != nil {
-		span.Warnf("ChunkStorage can not mark delete: %v", err)
+	if err := qosLmt.AcquireBid(uint64(args.Bid)); err != nil {
 		c.RespondError(err)
 		return
 	}
+	defer qosLmt.ReleaseBid(uint64(args.Bid))
 
-	// set io type
-	ctx = bnapi.SetIoType(ctx, bnapi.NormalIO)
-	ctx = limitio.SetLimitTrack(ctx)
+	if err := qosLmt.Acquire(); err != nil {
+		c.RespondError(err)
+		return
+	}
+	defer qosLmt.Release()
 
-	err = cs.MarkDelete(ctx, args.Bid)
+	err := cs.MarkDelete(ctx, args.Bid)
 	if err != nil {
 		err = handlerBidNotFoundErr(err)
-		span.Errorf("Failed to mark delete, err:%v", err)
+		span.Errorf("Failed to mark delete, args:%+v err:%v", args, err)
 		c.RespondError(err)
 		return
 	}
@@ -401,32 +499,7 @@ func (s *Service) ShardDelete(c *rpc.Context) {
 		return
 	}
 
-	limitKey := args.Bid
-	err := s.DeleteQpsLimitPerKey.Acquire(limitKey)
-	if err != nil {
-		span.Warnf("Shard delete concurrency key. key:%d", args.Bid)
-		c.RespondError(bloberr.ErrOverload)
-		return
-	}
-	defer s.DeleteQpsLimitPerKey.Release(limitKey)
-
-	qosLmt := ds.GetIoQos() // max io wait
-	if !qosLmt.TryAllow(qos.IOTypeDel) {
-		c.RespondError(bloberr.ErrOverload)
-		return
-	}
-	defer qosLmt.Release(qos.IOTypeDel)
-
-	perDiskLimitKey := cs.Disk().ID()
-	err = s.DeleteQpsLimitPerDisk.Acquire(perDiskLimitKey)
-	if err != nil {
-		span.Warnf("Shard delete overload perdisk. key:%d", cs.Disk().ID())
-		c.RespondError(bloberr.ErrOverload)
-		return
-	}
-	defer s.DeleteQpsLimitPerDisk.Release(perDiskLimitKey)
-
-	err = cs.AllowModify()
+	err := cs.AllowModify()
 	if err != nil {
 		span.Warnf("ChunkStorage can not delete: %v", err)
 		c.RespondError(err)
@@ -434,13 +507,30 @@ func (s *Service) ShardDelete(c *rpc.Context) {
 	}
 
 	// set io type
-	ctx = bnapi.SetIoType(ctx, bnapi.NormalIO)
-	ctx = limitio.SetLimitTrack(ctx)
+	ctx = bnapi.SetIoType(ctx, bnapi.DeleteIO)
+	qosLmt, exist := ds.GetIoQos().GetQueueQos(ctx)
+	if !exist {
+		span.Errorf("fail to get qos mgr, disk:%d", cs.Disk().ID())
+		c.RespondError(bloberr.ErrInternal)
+		return
+	}
+
+	if err = qosLmt.AcquireBid(uint64(args.Bid)); err != nil {
+		c.RespondError(err)
+		return
+	}
+	defer qosLmt.ReleaseBid(uint64(args.Bid))
+
+	if err = qosLmt.Acquire(); err != nil {
+		c.RespondError(err)
+		return
+	}
+	defer qosLmt.Release()
 
 	err = cs.Delete(ctx, args.Bid)
 	if err != nil {
 		err = handlerBidNotFoundErr(err)
-		span.Errorf("Failed to delete, err:%v", err)
+		span.Errorf("Failed to delete, args:%+v, err:%v", args, err)
 		c.RespondError(err)
 		return
 	}
@@ -448,7 +538,7 @@ func (s *Service) ShardDelete(c *rpc.Context) {
 
 /*
  *  method:         POST
- *  url:            /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
+ *  url:            /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}&nopdata=false
  *  request body:   bidData
  */
 func (s *Service) ShardPut(c *rpc.Context) {
@@ -485,11 +575,6 @@ func (s *Service) ShardPut(c *rpc.Context) {
 		return
 	}
 
-	// set io type
-	convertIoType(&args.Type) // For compatibility with previous versions io type
-	ctx = bnapi.SetIoType(ctx, args.Type)
-	ctx = limitio.SetLimitTrack(ctx)
-
 	s.lock.RLock()
 	ds, exist := s.Disks[args.DiskID]
 	s.lock.RUnlock()
@@ -504,6 +589,20 @@ func (s *Service) ShardPut(c *rpc.Context) {
 		return
 	}
 
+	// set io type
+	ctx = bnapi.SetIoType(ctx, args.Type)
+	qosLmt, exist := ds.GetIoQos().GetQueueQos(ctx)
+	if !exist {
+		span.Errorf("fail to get qos mgr, disk:%d", cs.Disk().ID())
+		c.RespondError(bloberr.ErrInternal)
+		return
+	}
+	if err := qosLmt.Acquire(); err != nil {
+		c.RespondError(err)
+		return
+	}
+	defer qosLmt.Release()
+
 	err := cs.AllowModify()
 	if err != nil {
 		span.Errorf("cs status check Invalid. err: %v", err)
@@ -511,7 +610,7 @@ func (s *Service) ShardPut(c *rpc.Context) {
 		return
 	}
 
-	if !cs.HasEnoughSpace(args.Size) {
+	if !args.NopData && !cs.HasEnoughSpace(args.Size) {
 		span.Errorf("cs has no enougn space. args:%v, chunk info:%v, disk:%v",
 			args, cs.ChunkInfo(ctx), cs.Disk().Stats())
 		c.RespondError(bloberr.ErrChunkNoSpace)
@@ -519,6 +618,7 @@ func (s *Service) ShardPut(c *rpc.Context) {
 	}
 
 	shard := core.NewShardWriter(args.Bid, args.Vuid, uint32(args.Size), c.Request.Body)
+	shard.NopData = args.NopData
 
 	start := time.Now()
 	err = cs.Write(ctx, shard)
@@ -530,7 +630,7 @@ func (s *Service) ShardPut(c *rpc.Context) {
 	}
 	ret.Crc = shard.Crc
 
-	if !shard.Inline {
+	if !shard.Inline && !shard.NopData {
 		start = time.Now()
 		err = cs.SyncData(ctx)
 		span.AppendTrackLog("sync", start, err)
@@ -559,9 +659,10 @@ func isShardErr(err error) bool {
 	return false
 }
 
-// For compatibility with previous versions io type, convert: 0->0; [1,8)->1
-func convertIoType(iot *bnapi.IOType) {
-	if *iot > bnapi.NormalIO {
-		*iot = bnapi.BackgroundIO
+// todo: will remove this function after all the old version nodes are upgraded.
+// for compatibility with previous versions io type
+func convertOldIOType(iot *bnapi.IOType) {
+	if *iot == bnapi.WriteIO {
+		*iot = bnapi.ReadIO
 	}
 }

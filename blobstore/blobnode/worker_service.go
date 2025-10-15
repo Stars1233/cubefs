@@ -18,7 +18,6 @@ import (
 	"context"
 	"time"
 
-	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/api/scheduler"
 	"github.com/cubefs/cubefs/blobstore/api/shardnode"
@@ -85,8 +84,9 @@ type WorkerConfig struct {
 	// scheduler client config
 	Scheduler scheduler.Config `json:"scheduler"`
 	// blbonode client config
-	BlobNode  bnapi.Config     `json:"blobnode"`
-	ShardNode shardnode.Config `json:"shardnode"`
+	BlobNode        client.Config    `json:"blobnode"`
+	ShardNode       shardnode.Config `json:"shardnode"`
+	EnableBatchRead bool             `json:"enable_batch_read"`
 
 	DroppedBidRecord *recordlog.Config `json:"dropped_bid_record"`
 }
@@ -117,10 +117,11 @@ func (cfg *WorkerConfig) checkAndFix() {
 	defaulter.LessOrEqual(&cfg.ShardRepairConcurrency, 1)
 	defaulter.LessOrEqual(&cfg.InspectConcurrency, 1)
 	defaulter.LessOrEqual(&cfg.DownloadShardConcurrency, 10)
-	defaulter.IntegerLessOrEqual[int64](&cfg.Scheduler.ClientTimeoutMs, 1000)
-	defaulter.IntegerLessOrEqual[int64](&cfg.Scheduler.HostSyncIntervalMs, 1000)
-	defaulter.IntegerLessOrEqual[int64](&cfg.BlobNode.ClientTimeoutMs, 1000)
-	defaulter.IntegerLessOrEqual[time.Duration](&cfg.ShardNode.Timeout.Duration, 5000*time.Millisecond)
+	defaulter.IntegerLessOrEqual(&cfg.Scheduler.ClientTimeoutMs, 1000)
+	defaulter.IntegerLessOrEqual(&cfg.Scheduler.HostSyncIntervalMs, 1000)
+	defaulter.IntegerLessOrEqual(&cfg.BlobNode.ClientTimeoutMs, 1000)
+	defaulter.IntegerLessOrEqual(&cfg.BlobNode.BatchReadTimeoutMs, 20000)
+	defaulter.IntegerLessOrEqual(&cfg.ShardNode.Timeout.Duration, 5000*time.Millisecond)
 }
 
 // NewWorkerService returns rpc worker_service
@@ -305,6 +306,7 @@ func (s *WorkerService) addBlobNodeTask(ctx context.Context, t *proto.Task) {
 		taskInfo:                 task,
 		downloadShardConcurrency: s.DownloadShardConcurrency,
 		blobNodeCli:              s.blobNodeCli,
+		enableBatchRead:          s.EnableBatchRead,
 	}); err != nil {
 		span.Errorf("add task failed: taskID[%s], err[%v]", task.TaskID, err)
 		return

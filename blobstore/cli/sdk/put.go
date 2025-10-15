@@ -59,10 +59,7 @@ func putBlob(c *grumble.Context) error {
 		if err != nil {
 			return fmt.Errorf("invalid (%s) %+v", wrap, err)
 		}
-		wrapArgs.BlobName = []byte(wrapArgs.BlobNameStr)
-		for _, keys := range wrapArgs.ShardKeysStr {
-			wrapArgs.ShardKeys = append(wrapArgs.ShardKeys, []byte(keys))
-		}
+		wrapArgs.BlobName = string(wrapArgs.BlobNameStr)
 		args = wrapArgs.PutBlobArgs
 	} else {
 		args, err = common.UnmarshalAny[acapi.PutBlobArgs]([]byte(c.Flags.String("args")))
@@ -70,7 +67,7 @@ func putBlob(c *grumble.Context) error {
 			return fmt.Errorf("invalid (%s) %+v", c.Flags.String("args"), err)
 		}
 	}
-	fmt.Printf("put blob name=%s, keys=%s, args json=%s\n", args.BlobName, args.ShardKeys, common.RawString(args))
+	fmt.Printf("put blob name=%s, args json=%s\n", args.BlobName, common.RawString(args))
 
 	reader, file, err := getReader(c, &args)
 	if err != nil {

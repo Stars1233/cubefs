@@ -15,6 +15,7 @@
 package trace
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -72,6 +73,12 @@ func (t Tags) Marshal() (ret []byte, err error) {
 // Tag is the alias of opentracing.Tag,
 type Tag = opentracing.Tag
 
+type startOptionCarrier struct {
+	opts opentracing.StartSpanOptions
+}
+
+func (*startOptionCarrier) Apply(*opentracing.StartSpanOptions) { _ = struct{}{} }
+
 // Options tracer options
 type Options struct {
 	maxLogsPerSpan   int
@@ -114,6 +121,13 @@ func NewTracer(serviceName string, opts ...TracerOption) *Tracer {
 // Create, start, and return a new Span with the given `operationName` and
 // incorporate the given StartSpanOption `opts`.
 func (t *Tracer) StartSpan(operationName string, options ...opentracing.StartSpanOption) opentracing.Span {
+	if len(options) == 1 {
+		carrier, ok := options[0].(*startOptionCarrier)
+		if ok && carrier != nil {
+			return t.startSpanWithOptions(operationName, carrier.opts)
+		}
+	}
+
 	sso := opentracing.StartSpanOptions{}
 	for _, o := range options {
 		o.Apply(&sso)
@@ -125,6 +139,23 @@ func (t *Tracer) startSpanWithOptions(operationName string, opts opentracing.Sta
 	startTime := opts.StartTime
 	if startTime.IsZero() {
 		startTime = time.Now()
+	}
+
+	if len(opts.References) == 1 {
+		ref := opts.References[0]
+		spanCtx, ok := ref.ReferencedContext.(*SpanContext)
+		if ok && spanCtx.spanFromPool != nil { // cached
+			span := spanCtx.spanFromPool
+			for key, val := range opts.Tags {
+				span.SetTag(key, val)
+			}
+
+			span.operationName = operationName
+			span.tracer = t
+			span.startTime = startTime
+			span.rootSpan = spanCtx.parentID == 0
+			return span
+		}
 	}
 
 	var (
@@ -159,18 +190,18 @@ func (t *Tracer) startSpanWithOptions(operationName string, opts opentracing.Sta
 	}
 
 	if !hasParent || (parent != nil && !parent.IsValid()) {
-		ctx.traceID = RandomID().String()
 		ctx.spanID = RandomID()
+		ctx.resetID("")
 		ctx.parentID = 0
 	} else {
-		ctx.traceID = parent.traceID
 		ctx.spanID = RandomID()
+		ctx.resetID(parent.traceID())
 		ctx.parentID = parent.spanID
 	}
 	if hasParent {
 		// copy baggage items
-		parent.ForeachBaggageItems(func(k string, v []string) bool {
-			ctx.setBaggageItem(k, v)
+		parent.ForeachBaggageItems(func(k string, b []*bytes.Buffer) bool {
+			ctx.setBaggageItemBytes(k, b)
 			return true
 		})
 	}
@@ -233,7 +264,9 @@ func StartSpanFromContext(ctx context.Context, operationName string, opts ...ope
 func StartSpanFromContextWithTraceID(ctx context.Context, operationName string, traceID string, opts ...opentracing.StartSpanOption) (Span, context.Context) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, operationName, opts...)
 	if s, ok := span.(*spanImpl); ok {
-		s.context.traceID = traceID
+		if traceID != "" {
+			s.context.resetID(traceID)
+		}
 		return s, ctx
 	}
 	return span.(Span), ctx
@@ -241,12 +274,23 @@ func StartSpanFromContextWithTraceID(ctx context.Context, operationName string, 
 
 // StartSpanFromHTTPHeaderSafe starts and return a Span with `operationName` and http.Request
 func StartSpanFromHTTPHeaderSafe(r *http.Request, operationName string) (Span, context.Context) {
-	spanCtx, _ := Extract(HTTPHeaders, HTTPHeadersCarrier(r.Header))
 	traceID := r.Header.Get(RequestIDKey)
-	if traceID == "" {
-		return StartSpanFromContext(r.Context(), operationName, ext.RPCServerOption(spanCtx))
+	spanCtx, err := Extract(HTTPHeaders, HTTPHeadersCarrier(r.Header))
+	if err != nil {
+		return StartCacheableSpan(r.Context(), operationName, traceID)
 	}
-	return StartSpanFromContextWithTraceID(r.Context(), operationName, traceID, ext.RPCServerOption(spanCtx))
+	optsCarrier := spanCtx.(*SpanContext).optsCarrier
+	return StartSpanFromContextWithTraceID(r.Context(), operationName, traceID, optsCarrier...)
+}
+
+// StartCacheableSpan starts a cahced Span, you'd better finish it.
+func StartCacheableSpan(ctx context.Context, operationName, traceID string) (Span, context.Context) {
+	span := poolSpan.Get().(*spanImpl)
+	span.context.spanID = RandomID()
+	span.context.resetID(traceID)
+	// span.context.spanFromPool = span // notify release to pool // TODO: cacheable later
+	optsCarrier := span.context.optsCarrier
+	return StartSpanFromContextWithTraceID(ctx, operationName, traceID, optsCarrier...)
 }
 
 // ContextWithSpan returns a new `context.Context` that holds a reference to

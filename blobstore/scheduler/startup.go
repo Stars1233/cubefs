@@ -105,10 +105,14 @@ func NewService(conf *Config) (svr *Service, err error) {
 	}
 
 	clusterMgrCli := client.NewClusterMgrClient(&conf.ClusterMgr)
+	if err := cmapi.LoadExtendCodemode(context.Background(), clusterMgrCli); err != nil {
+		log.Errorf("load extend codemode err[%v]", err)
+		return nil, err
+	}
 
 	blobnodeCli := client.NewBlobnodeClient(&conf.Blobnode)
 	switchMgr := taskswitch.NewSwitchMgr(clusterMgrCli)
-	volumeUpdater := client.NewVolumeUpdater(&conf.Scheduler, scheme+localHost+conf.BindAddr)
+	taskCli := client.NewTaskClient(&conf.Scheduler, scheme+localHost+conf.BindAddr)
 
 	topoConf := &clusterTopologyConfig{
 		ClusterID:               conf.ClusterID,
@@ -120,7 +124,7 @@ func NewService(conf *Config) (svr *Service, err error) {
 	topologyMgr := NewClusterTopologyMgr(clusterMgrCli, topoConf)
 
 	kafkaClient := base.NewKafkaConsumer(conf.Kafka.BrokerList)
-	shardRepairMgr, err := NewShardRepairMgr(&conf.ShardRepair, topologyMgr, switchMgr, blobnodeCli, clusterMgrCli, kafkaClient)
+	shardRepairMgr, err := NewShardRepairMgr(&conf.ShardRepair, topologyMgr, switchMgr, blobnodeCli, clusterMgrCli, kafkaClient, taskCli)
 	if err != nil {
 		log.Errorf("new shard repair mgr: cfg[%+v], err[%w]", conf.ShardRepair, err)
 		return nil, err
@@ -135,7 +139,7 @@ func NewService(conf *Config) (svr *Service, err error) {
 	svr.shardRepairMgr = shardRepairMgr
 	svr.blobDeleteMgr = deleteMgr
 	svr.clusterTopology = topologyMgr
-	svr.volumeUpdater = volumeUpdater
+	svr.volumeUpdater = taskCli
 	svr.clusterMgrCli = clusterMgrCli
 
 	if err = svr.register(conf.ServiceRegister); err != nil {
@@ -166,13 +170,13 @@ func NewService(conf *Config) (svr *Service, err error) {
 	if err != nil {
 		return nil, err
 	}
-	balanceMgr := NewBalanceMgr(clusterMgrCli, volumeUpdater, balanceTaskSwitch, topologyMgr, taskLogger, &conf.Balance)
+	balanceMgr := NewBalanceMgr(clusterMgrCli, taskCli, balanceTaskSwitch, topologyMgr, taskLogger, &conf.Balance)
 
 	diskDropTaskSwitch, err := switchMgr.AddSwitch(proto.TaskTypeDiskDrop.String())
 	if err != nil {
 		return nil, err
 	}
-	diskDropMgr := NewDiskDropMgr(clusterMgrCli, volumeUpdater, diskDropTaskSwitch, taskLogger, &conf.DiskDrop, topologyMgr)
+	diskDropMgr := NewDiskDropMgr(clusterMgrCli, taskCli, diskDropTaskSwitch, taskLogger, &conf.DiskDrop, topologyMgr)
 
 	// new disk repair manager
 	diskRepairTaskSwitch, err := switchMgr.AddSwitch(proto.TaskTypeDiskRepair.String())
@@ -182,7 +186,7 @@ func NewService(conf *Config) (svr *Service, err error) {
 
 	diskRepairMgr := NewDiskRepairMgr(clusterMgrCli, diskRepairTaskSwitch, taskLogger, &conf.DiskRepair)
 
-	manualMigMgr := NewManualMigrateMgr(clusterMgrCli, volumeUpdater, taskLogger, &conf.ManualMigrate)
+	manualMigMgr := NewManualMigrateMgr(clusterMgrCli, taskCli, taskLogger, &conf.ManualMigrate)
 
 	mqProxy := client.NewProxyClient(&conf.Proxy, cmapi.New(&conf.ClusterMgr), conf.ClusterID)
 	inspectorTaskSwitch, err := switchMgr.AddSwitch(proto.TaskTypeVolumeInspect.String())
@@ -372,6 +376,7 @@ func NewHandler(service *Service) *rpc.Router {
 	rpc.RegisterArgsParser(&api.AcquireArgs{}, "json")
 	rpc.RegisterArgsParser(&api.DiskMigratingStatsArgs{}, "json")
 	rpc.RegisterArgsParser(&api.MigrateTaskDetailArgs{}, "json")
+	rpc.RegisterArgsParser(&api.CheckTaskExistArgs{}, "json")
 
 	// rpc http svr interface
 	rpc.GET(api.PathTaskAcquire, service.HTTPTaskAcquire, rpc.OptArgsQuery())
@@ -392,6 +397,8 @@ func NewHandler(service *Service) *rpc.Router {
 	rpc.GET(api.PathStatsDiskMigrating, service.HTTPDiskMigratingStats, rpc.OptArgsQuery())
 
 	rpc.POST(api.PathUpdateVolume, service.HTTPUpdateVolume, rpc.OptArgsBody())
+
+	rpc.GET(api.PathTaskExistCheck, service.HTTPCheckTaskExist, rpc.OptArgsQuery())
 
 	return rpc.DefaultRouter
 }

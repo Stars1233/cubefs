@@ -113,6 +113,7 @@ type IMigrator interface {
 	GetTask(ctx context.Context, taskID string) (*proto.MigrateTask, error)
 	ListAllTask(ctx context.Context) (tasks []*proto.MigrateTask, err error)
 	ListAllTaskByDiskID(ctx context.Context, diskID proto.DiskID) (tasks []*proto.MigrateTask, err error)
+	IsTaskExist(diskID proto.DiskID, vuid proto.Vuid) bool
 }
 
 type migratingDisks struct {
@@ -204,6 +205,17 @@ func (m *diskMigratingVuids) isMigratingDisk(diskID proto.DiskID) (ok bool) {
 	defer m.lock.RUnlock()
 	_, ok = m.vuids[diskID]
 	return
+}
+
+func (m *diskMigratingVuids) existByVuid(diskID proto.DiskID, vuid proto.Vuid) bool {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	vuids, ok := m.vuids[diskID]
+	if !ok {
+		return false
+	}
+	_, ok = vuids[vuid]
+	return ok
 }
 
 type migratedTasks map[string]time.Time
@@ -331,6 +343,8 @@ type MigrateConfig struct {
 	finishTaskCallback taskLimitFunc
 	// load drop task
 	loadTaskCallback taskLimitFunc
+	// report task
+	reportTaskCallback taskReportFunc
 }
 
 type clearJunkTasksFunc func(ctx context.Context, tasks []*proto.MigrateTask) error
@@ -347,6 +361,12 @@ var defaultDiskTaskLimitFunc = func(diskId proto.DiskID) {
 	_ = struct{}{}
 }
 
+type taskReportFunc func(diskId proto.DiskID, vuid proto.Vuid)
+
+var defaultTaskReportFunc = func(diskId proto.DiskID, vuid proto.Vuid) {
+	_ = struct{}{}
+}
+
 // MigrateMgr migrate manager
 type MigrateMgr struct {
 	closer.Closer
@@ -355,7 +375,7 @@ type MigrateMgr struct {
 	diskMigratingVuids *diskMigratingVuids
 
 	clusterMgrCli client.ClusterMgrAPI
-	volumeUpdater client.IVolumeUpdater
+	volumeUpdater client.TaskAPI
 
 	taskSwitch taskswitch.ISwitcher
 
@@ -376,12 +396,14 @@ type MigrateMgr struct {
 	clearJunkTasksCallBack clearJunkTasksFunc
 	// load and finish drop task
 	finishTaskCallback, loadTaskCallback taskLimitFunc
+	// report task
+	reportTaskCallback taskReportFunc
 }
 
 // NewMigrateMgr returns migrate manager
 func NewMigrateMgr(
 	clusterMgrCli client.ClusterMgrAPI,
-	volumeUpdater client.IVolumeUpdater,
+	volumeUpdater client.TaskAPI,
 	taskSwitch taskswitch.ISwitcher,
 	taskLogger recordlog.Encoder,
 	conf *MigrateConfig,
@@ -409,6 +431,7 @@ func NewMigrateMgr(
 		finishTaskCallback:     conf.finishTaskCallback,
 		loadTaskCallback:       conf.loadTaskCallback,
 		lockVolFailHandleFunc:  conf.lockFailHandleFunc,
+		reportTaskCallback:     conf.reportTaskCallback,
 
 		Closer: closer.New(),
 	}
@@ -577,7 +600,7 @@ func (mgr *MigrateMgr) prepareTask() (err error) {
 		// 2. alloc chunk failed and VolTaskLockerInst().Unlock
 		// 3. this volume maybe execute other tasks, such as disk repair
 		// 4. then enter this branch and volume status is locked
-		err := mgr.clusterMgrCli.UnlockVolume(ctx, migTask.SourceVuid.Vid())
+		err := mgr.clusterMgrCli.UnlockVolume(ctx, migTask.SourceVuid.Vid(), volInfo.Epoch)
 		if err != nil {
 			span.Errorf("before finish in advance try unlock volume failed: vid[%d], err[%+v]",
 				migTask.SourceVuid.Vid(), err)
@@ -589,7 +612,7 @@ func (mgr *MigrateMgr) prepareTask() (err error) {
 	}
 
 	// lock volume
-	err = mgr.clusterMgrCli.LockVolume(ctx, migTask.SourceVuid.Vid())
+	err = mgr.clusterMgrCli.LockVolume(ctx, migTask.SourceVuid.Vid(), volInfo.Epoch)
 	if err != nil {
 		if rpc.DetectStatusCode(err) == errcode.CodeLockNotAllow {
 			// disk drop lockVolFailHandleFunc is nil, and can not finished in advance
@@ -707,8 +730,12 @@ func (mgr *MigrateMgr) finishTask() (err error) {
 		}
 		err = nil
 	}
-
-	err = mgr.clusterMgrCli.UnlockVolume(ctx, migrateTask.SourceVuid.Vid())
+	volInfo, err := mgr.clusterMgrCli.GetVolumeInfo(ctx, migrateTask.SourceVuid.Vid())
+	if err != nil {
+		span.Errorf("get volume from clustermgr failed: err[%+v]", err)
+		return err
+	}
+	err = mgr.clusterMgrCli.UnlockVolume(ctx, migrateTask.SourceVuid.Vid(), volInfo.Epoch)
 	if err != nil {
 		span.Errorf("unlock volume failed: err[%+v]", err)
 		return
@@ -734,6 +761,7 @@ func (mgr *MigrateMgr) finishTask() (err error) {
 	// add delete task and check it again
 	mgr.addDeletedTask(migrateTask)
 	mgr.finishTaskCallback(migrateTask.SourceDiskID)
+	mgr.reportTaskCallback(migrateTask.SourceDiskID, migrateTask.SourceVuid)
 
 	span.Infof("finish task phase success: task_id[%s], state[%v]", migrateTask.TaskID, migrateTask.State)
 	return
@@ -858,7 +886,7 @@ func (mgr *MigrateMgr) DeletedTasks() []DeletedTask {
 
 func (mgr *MigrateMgr) addMigratingVuid(diskID proto.DiskID, vuid proto.Vuid, taskID string) {
 	switch mgr.taskType {
-	case proto.TaskTypeBalance: // only balance task need to add
+	case proto.TaskTypeBalance, proto.TaskTypeDiskDrop, proto.TaskTypeManualMigrate:
 		mgr.diskMigratingVuids.addMigratingVuid(diskID, vuid, taskID)
 	default:
 	}
@@ -866,7 +894,7 @@ func (mgr *MigrateMgr) addMigratingVuid(diskID proto.DiskID, vuid proto.Vuid, ta
 
 func (mgr *MigrateMgr) deleteMigratingVuid(diskID proto.DiskID, vuid proto.Vuid) {
 	switch mgr.taskType {
-	case proto.TaskTypeBalance: // only balance task need to add
+	case proto.TaskTypeBalance, proto.TaskTypeDiskDrop, proto.TaskTypeManualMigrate:
 		mgr.diskMigratingVuids.deleteMigratingVuid(diskID, vuid)
 	default:
 	}
@@ -1139,6 +1167,11 @@ func (mgr *MigrateMgr) ReportWorkerTaskStats(st *api.BlobnodeTaskReportArgs) {
 	mgr.taskStatsMgr.ReportWorkerTaskStats(st.TaskID, st.TaskStats, st.IncreaseDataSizeByte, st.IncreaseShardCnt)
 }
 
+// IsTaskExist returns true if disk migrate task exist
+func (mgr *MigrateMgr) IsTaskExist(diskID proto.DiskID, vuid proto.Vuid) bool {
+	return mgr.diskMigratingVuids.existByVuid(diskID, vuid)
+}
+
 // Enabled returns enable or not.
 func (mgr *MigrateMgr) Enabled() bool {
 	return mgr.taskSwitch.Enabled()
@@ -1158,6 +1191,9 @@ func checkMigrateConf(conf *MigrateConfig) {
 	}
 	if conf.loadTaskCallback == nil {
 		conf.loadTaskCallback = defaultDiskTaskLimitFunc
+	}
+	if conf.reportTaskCallback == nil {
+		conf.reportTaskCallback = defaultTaskReportFunc
 	}
 }
 

@@ -121,6 +121,9 @@ func TestChunkReport2(t *testing.T) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
+		if implementExtendCodemode(w, req) {
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -129,6 +132,7 @@ func TestChunkReport2(t *testing.T) {
 
 	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"ChunkReport2")
 	require.NoError(t, err)
+	defer os.RemoveAll(workDir)
 
 	err = os.MkdirAll(workDir, 0o755)
 	require.NoError(t, err)

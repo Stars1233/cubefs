@@ -17,6 +17,7 @@ package blobnode
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"hash/crc32"
 	"io"
 	"sync"
@@ -29,7 +30,9 @@ import (
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/blobnode/client"
 	"github.com/cubefs/cubefs/blobstore/common/codemode"
+	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
+	"github.com/cubefs/cubefs/blobstore/common/trace"
 	_ "github.com/cubefs/cubefs/blobstore/testing/nolog"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 )
@@ -183,14 +186,14 @@ func (getter *MockGetter) setVunitStatus(vuid proto.Vuid, status clustermgr.Chun
 	}
 }
 
-func (getter *MockGetter) PutShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, size int64, body io.Reader, ioType api.IOType) (err error) {
+func (getter *MockGetter) PutShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, size int64, body []byte, ioType api.IOType) (err error) {
 	getter.mu.Lock()
 	defer getter.mu.Unlock()
 	if err, ok := getter.failVuid[location.Vuid]; ok {
 		return err
 	}
 	data := make([]byte, size)
-	body.Read(data)
+	copy(data, body)
 	getter.vunits[location.Vuid].putShard(bid, data)
 	return
 }
@@ -206,6 +209,19 @@ func (getter *MockGetter) GetShard(ctx context.Context, location proto.VunitLoca
 	return io.NopCloser(reader), crc, err
 }
 
+func (getter *MockGetter) GetShards(ctx context.Context, location proto.VunitLocation, bids []api.BidInfo, ioType api.IOType) (get api.ShardGetter, err error) {
+	getter.mu.Lock()
+	defer getter.mu.Unlock()
+	buf := make([]byte, 0)
+	header := make([]byte, api.GetShardsHeaderSize)
+	for _, bid := range bids {
+		binary.BigEndian.PutUint32(header, 200)
+		buf = append(buf, header...)
+		buf = append(buf, getter.vunits[location.Vuid].shards[bid.Bid]...)
+	}
+	return &mockShardGetter{body: io.NopCloser(bytes.NewReader(buf)), bids: bids}, nil
+}
+
 func (getter *MockGetter) MarkDelete(ctx context.Context, vuid proto.Vuid, bid proto.BlobID) {
 	getter.mu.Lock()
 	defer getter.mu.Unlock()
@@ -218,7 +234,7 @@ func (getter *MockGetter) Delete(ctx context.Context, vuid proto.Vuid, bid proto
 	getter.vunits[vuid].delete(bid)
 }
 
-func (getter *MockGetter) StatShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID) (si *client.ShardInfo, err error) {
+func (getter *MockGetter) StatShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, ioType api.IOType) (si *client.ShardInfo, err error) {
 	getter.mu.Lock()
 	defer getter.mu.Unlock()
 	vuid := location.Vuid
@@ -386,4 +402,33 @@ func (m *mockVunit) recover(bid proto.BlobID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.bidInfos[bid].Flag = api.ShardStatusNormal
+}
+
+type mockShardGetter struct {
+	body io.ReadCloser
+	bids []api.BidInfo
+	idx  int
+}
+
+func (b *mockShardGetter) NextShard(ctx context.Context) (io.ReadCloser, error, bool) {
+	span := trace.SpanFromContextSafe(ctx)
+	if b.idx >= len(b.bids) {
+		return nil, io.EOF, false
+	}
+	header := make([]byte, api.GetShardsHeaderSize)
+	_, err := io.ReadFull(b.body, header)
+	if err != nil {
+		return nil, err, false
+	}
+	code := binary.BigEndian.Uint32(header)
+	if code != uint32(200) {
+		span.Errorf("download shard failed, errCode: %s", code)
+		return nil, bloberr.ErrBidNotMatch, false
+	}
+	b.idx++
+	return b.body, nil, true
+}
+
+func (b *mockShardGetter) Close() error {
+	return b.body.Close()
 }

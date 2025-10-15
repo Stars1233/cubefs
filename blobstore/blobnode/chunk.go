@@ -73,6 +73,11 @@ func (s *Service) ChunkCreate(c *rpc.Context) {
 		return
 	}
 
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
+		return
+	}
+
 	cs, err := ds.CreateChunk(ctx, args.Vuid, args.ChunkSize)
 	if err != nil {
 		span.Errorf("Failed register vuid:%v, err:%v", args.DiskID, err)
@@ -108,6 +113,11 @@ func (s *Service) ChunkInspect(c *rpc.Context) {
 	if !exist {
 		span.Errorf("diskID %d not exist", args.DiskID)
 		c.RespondError(bloberr.ErrNoSuchDisk)
+		return
+	}
+
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
 		return
 	}
 
@@ -235,6 +245,11 @@ func (s *Service) ChunkReadonly(c *rpc.Context) {
 		return
 	}
 
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
+		return
+	}
+
 	cs, exist := ds.GetChunkStorage(args.Vuid)
 	if !exist {
 		span.Errorf("readonly vuid:%v not found", args.Vuid)
@@ -256,7 +271,7 @@ func (s *Service) ChunkReadonly(c *rpc.Context) {
 	// change persistence status
 	err = ds.UpdateChunkStatus(ctx, args.Vuid, clustermgr.ChunkStatusReadOnly)
 	if err != nil {
-		span.Errorf("set args:(%s) readOnly failed: %v", args, err)
+		span.Errorf("set args:(%+v) readOnly failed: %+v", args, err)
 		c.RespondError(err)
 		return
 	}
@@ -304,6 +319,11 @@ func (s *Service) ChunkReadwrite(c *rpc.Context) {
 		return
 	}
 
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
+		return
+	}
+
 	cs, exist := ds.GetChunkStorage(args.Vuid)
 	if !exist {
 		span.Errorf("readwrite vuid:%v not found", args.Vuid)
@@ -326,7 +346,7 @@ func (s *Service) ChunkReadwrite(c *rpc.Context) {
 	// change persistence status
 	err = ds.UpdateChunkStatus(ctx, args.Vuid, clustermgr.ChunkStatusNormal)
 	if err != nil {
-		span.Errorf("set args:(%s) readWrite failed: %v", args, err)
+		span.Errorf("set args:(%+v) readWrite failed: %+v", args, err)
 		c.RespondError(err)
 		return
 	}
@@ -361,6 +381,11 @@ func (s *Service) ChunkList(c *rpc.Context) {
 	if !exist {
 		span.Errorf("diskid(%v) no such disk", args.DiskID)
 		c.RespondError(bloberr.ErrNoSuchDisk)
+		return
+	}
+
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
 		return
 	}
 
@@ -410,6 +435,11 @@ func (s *Service) ChunkStat(c *rpc.Context) {
 	if !exist {
 		span.Errorf("stat disk:%v not found", args.DiskID)
 		c.RespondError(bloberr.ErrNoSuchDisk)
+		return
+	}
+
+	if !ds.IsWritable() {
+		c.RespondError(bloberr.ErrDiskBroken)
 		return
 	}
 

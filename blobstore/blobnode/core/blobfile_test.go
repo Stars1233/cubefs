@@ -23,43 +23,27 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cubefs/cubefs/blobstore/blobnode/base/qos"
+	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
+	"github.com/cubefs/cubefs/blobstore/blobnode/base"
 	"github.com/cubefs/cubefs/blobstore/testing/mocks"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 	"github.com/cubefs/cubefs/blobstore/util/mergetask"
-	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
-func TestBlobFile_Op(t *testing.T) {
-	testDir, err := os.MkdirTemp(os.TempDir(), "BlobFileOp")
-	require.NoError(t, err)
-	defer os.RemoveAll(testDir)
-
-	posixfilepath := filepath.Join(testDir, "PoxsixFile")
-	log.Info(posixfilepath)
-
-	temppath := filepath.Join(posixfilepath, "xxxtemp")
-	f, err := OpenFile(temppath, false)
-	require.Error(t, err)
-	require.Nil(t, f)
-
-	f, err = OpenFile(posixfilepath, true)
-	require.NoError(t, err)
-
-	require.NotNil(t, f)
-
+func doBlobFileOp(t *testing.T, f *os.File, emptyIoPool bool) {
 	// create
 	syncWorker := mergetask.NewMergeTask(-1, func(interface{}) error { return nil })
 
 	ctr := gomock.NewController(t)
 	ioPool := mocks.NewMockIoPool(ctr)
-	ioPool.EXPECT().Submit(gomock.Any()).Do(func(args taskpool.IoPoolTaskArgs) {
-		args.TaskFn()
+	ioPool.EXPECT().Submit(gomock.Any()).DoAndReturn(func(args base.IoPoolTaskArgs) error {
+		return args.TaskFn()
 	}).AnyTimes()
-	ioPools := map[qos.IOTypeRW]taskpool.IoPool{
-		qos.IOTypeRead:  ioPool,
-		qos.IOTypeWrite: ioPool,
-		qos.IOTypeDel:   ioPool,
+	ioPools := map[bnapi.IOType]base.IoPool{
+		bnapi.ReadIO:       ioPool,
+		bnapi.WriteIO:      ioPool,
+		bnapi.DeleteIO:     ioPool,
+		bnapi.BackgroundIO: ioPool,
 	}
 
 	ef := blobFile{f, 1, syncWorker, nil, ioPools}
@@ -73,33 +57,22 @@ func TestBlobFile_Op(t *testing.T) {
 
 	data := []byte("test data")
 
-	// write
-	n, err := ef.WriteAt(data, 0)
-	require.NoError(t, err)
-	require.Equal(t, len(data), n)
-
-	// read
-	buf := make([]byte, len(data))
-	n, err = ef.ReadAt(buf, 0)
-	require.NoError(t, err)
-	require.Equal(t, len(data), n)
-
-	require.Equal(t, data, buf)
-
 	// WriteAtCtx
 	ctx, cancel := context.WithCancel(context.Background())
-	n, err = ef.WriteAtCtx(ctx, data, 0)
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+	n, err := ef.WriteAtCtx(ctx, data, 0)
 	require.NoError(t, err)
 	require.Equal(t, len(data), n)
 
 	cancel()
 	n, err = ef.WriteAtCtx(ctx, data, 0)
-	require.ErrorIs(t, context.Canceled, err)
+	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 0, n)
 
 	// ReadAtCtx
 	ctx, cancel = context.WithCancel(context.Background())
-	buf = make([]byte, len(data))
+	ctx = bnapi.SetIoType(ctx, bnapi.ReadIO)
+	buf := make([]byte, len(data))
 	n, err = ef.ReadAtCtx(ctx, buf, 0)
 	require.NoError(t, err)
 	require.Equal(t, len(data), n)
@@ -107,7 +80,7 @@ func TestBlobFile_Op(t *testing.T) {
 
 	cancel()
 	n, err = ef.ReadAtCtx(ctx, buf, 0)
-	require.ErrorIs(t, context.Canceled, err)
+	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 0, n)
 
 	// stat
@@ -139,4 +112,170 @@ func TestBlobFile_Op(t *testing.T) {
 	require.Equal(t, int32(stat.Size), int32(1*1024*1024))
 	// phy allocate == 0
 	require.Equal(t, int(stat.Blocks), 0)
+}
+
+func TestBlobFile_Op(t *testing.T) {
+	testDir, err := os.MkdirTemp(os.TempDir(), "BlobFileOp")
+	require.NoError(t, err)
+	defer os.RemoveAll(testDir)
+
+	posixfilepath := filepath.Join(testDir, "PoxsixFile")
+	log.Info(posixfilepath)
+
+	temppath := filepath.Join(posixfilepath, "xxxtemp")
+	f, err := OpenFile(temppath, false)
+	require.Error(t, err)
+	require.Nil(t, f)
+
+	f, err = OpenFile(posixfilepath, true)
+	require.NoError(t, err)
+	require.NotNil(t, f)
+
+	// enable io pools
+	doBlobFileOp(t, f, false)
+
+	// invalid/empty io pools
+	posixfilepath2 := filepath.Join(testDir, "PoxsixFile2")
+	f, err = OpenFile(posixfilepath2, true)
+	require.NoError(t, err)
+	require.NotNil(t, f)
+
+	doBlobFileOp(t, f, true)
+}
+
+func TestBlobFile_doTaskFnCtxCancel(t *testing.T) {
+	testDir, err := os.MkdirTemp(os.TempDir(), "BlobFileTaskCancel")
+	require.NoError(t, err)
+	defer os.RemoveAll(testDir)
+
+	posixfilepath := filepath.Join(testDir, "PoxsixFile")
+	log.Info(posixfilepath)
+
+	temppath := filepath.Join(posixfilepath, "xxxtemp")
+	f, err := OpenFile(temppath, false)
+	require.Error(t, err)
+	require.Nil(t, f)
+
+	f, err = OpenFile(posixfilepath, true)
+	require.NoError(t, err)
+
+	require.NotNil(t, f)
+
+	// create
+	syncWorker := mergetask.NewMergeTask(-1, func(interface{}) error { return nil })
+
+	ctr := gomock.NewController(t)
+	ioPool := mocks.NewMockIoPool(ctr)
+	ioPools := map[bnapi.IOType]base.IoPool{
+		bnapi.ReadIO:       ioPool,
+		bnapi.WriteIO:      ioPool,
+		bnapi.DeleteIO:     ioPool,
+		bnapi.BackgroundIO: ioPool,
+	}
+
+	ef := blobFile{f, 1, syncWorker, nil, ioPools}
+	fd := ef.Fd()
+	require.NotNil(t, fd)
+
+	info, err := ef.Stat()
+	require.NoError(t, err)
+	require.NotNil(t, info)
+
+	data := []byte("test data")
+
+	// Test 1: Normal WriteAtCtx - should succeed
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+	ioPool.EXPECT().Submit(gomock.Any()).DoAndReturn(func(args base.IoPoolTaskArgs) error {
+		return args.TaskFn()
+	})
+	n, err := ef.WriteAtCtx(ctx, data, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+
+	ctx = bnapi.SetIoType(ctx, bnapi.BackgroundIO)
+	ioPool.EXPECT().Submit(gomock.Any()).DoAndReturn(func(args base.IoPoolTaskArgs) error {
+		cancel()
+		return args.TaskFn()
+	})
+	n, err = ef.WriteAtCtx(ctx, data, 0)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, n)
+
+	// Test 2: Normal ReadAtCtx - should succeed
+	ctx, cancel = context.WithCancel(context.Background())
+	ctx = bnapi.SetIoType(ctx, bnapi.ReadIO)
+	buf := make([]byte, len(data))
+	ioPool.EXPECT().Submit(gomock.Any()).DoAndReturn(func(args base.IoPoolTaskArgs) error {
+		return args.TaskFn()
+	})
+	n, err = ef.ReadAtCtx(ctx, buf, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+	require.Equal(t, data, buf)
+
+	// Test 3: Context canceled before calling WriteAtCtx, blobfile checks ctx.Err() before calling Submit
+	// If context is already canceled, it returns immediately without calling Submit
+	ctx, cancel = context.WithCancel(context.Background())
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+
+	// Cancel context before calling WriteAtCtx
+	cancel()
+
+	// No mock expectation needed since Submit won't be called when context is already canceled
+	n, err = ef.WriteAtCtx(ctx, data, 0)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, n)
+
+	// Test 4: Context canceled before calling ReadAtCtx
+	ctx, cancel = context.WithCancel(context.Background())
+	ctx = bnapi.SetIoType(ctx, bnapi.ReadIO)
+
+	// Cancel context before calling ReadAtCtx
+	cancel()
+
+	// No mock expectation needed since Submit won't be called when context is already canceled
+	n, err = ef.ReadAtCtx(ctx, buf, 0)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, n)
+
+	// Test 5: Context canceled during task execution in WriteAtCtx
+	// This simulates the case where iopool detects context cancellation and returns context.Canceled
+	ctx = bnapi.SetIoType(context.Background(), bnapi.WriteIO)
+	ioPool.EXPECT().Submit(gomock.Any()).Return(context.Canceled)
+
+	n, err = ef.WriteAtCtx(ctx, data, 0)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, n)
+
+	// Test 6: Context canceled during task execution in ReadAtCtx
+	// This simulates the case where iopool detects context cancellation and returns context.Canceled
+	ctx = bnapi.SetIoType(context.Background(), bnapi.ReadIO)
+	ioPool.EXPECT().Submit(gomock.Any()).Return(context.Canceled)
+
+	n, err = ef.ReadAtCtx(ctx, buf, 0)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, n)
+
+	// Test 7: Allocate with context cancellation during task execution
+	ioPool.EXPECT().Submit(gomock.Any()).Return(context.Canceled)
+	err = ef.Allocate(0, 1024)
+	require.ErrorIs(t, err, context.Canceled)
+
+	// Test 8: Discard with context cancellation during task execution
+	ioPool.EXPECT().Submit(gomock.Any()).Return(context.Canceled)
+	err = ef.Discard(0, 1024)
+	require.ErrorIs(t, err, context.Canceled)
+
+	// Test 9: Sync with context cancellation during task execution
+	ioPool.EXPECT().Submit(gomock.Any()).Return(context.Canceled)
+	err = ef.Sync()
+	require.ErrorIs(t, err, context.Canceled)
+
+	// Test 10: Panic case for invalid IO type
+	require.Panics(t, func() {
+		ctx = context.Background()
+		ctx = bnapi.SetIoType(ctx, bnapi.IOTypeMax)
+		ef.ReadAtCtx(ctx, buf, 0)
+	})
 }

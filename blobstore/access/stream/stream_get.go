@@ -34,6 +34,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	"github.com/cubefs/cubefs/blobstore/util"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 	"github.com/cubefs/cubefs/blobstore/util/retry"
 )
@@ -168,6 +169,10 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location proto.Location,
 			}
 		}
 
+		var spanpipe trace.Span
+		spanpipe, ctx = trace.StartSpanFromContextWithTraceID(context.Background(), "", span.TraceID())
+		defer spanpipe.Finish()
+
 		// data stream flow:
 		// client <--copy-- pipeline <--swap-- readBlob <--copy-- blobnode
 		//
@@ -187,7 +192,7 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location proto.Location,
 					if blobVolume == nil || blobVolume.Vid != blob.Vid {
 						blobVolume, err = h.getVolume(ctx, clusterID, blob.Vid, true)
 						if err != nil {
-							span.Error("get volume", err)
+							spanpipe.Error("get volume", err)
 							ch <- pipeBuffer{err: err}
 							return
 						}
@@ -195,11 +200,11 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location proto.Location,
 						// do not use local shards
 						ordered := h.CodeModesGetOrdered[blobVolume.CodeMode]
 						sortedVuids = genSortedVuidByIDC(ctx, serviceController, h.IDC, blobVolume.Units[:tactic.N+tactic.M], ordered)
-						span.Debugf("to read %s with read-shard-x:%d active-shard-n:%d of data-n:%d party-n:%d",
+						spanpipe.Debugf("to read %s with read-shard-x:%d active-shard-n:%d of data-n:%d party-n:%d",
 							blob.ID(), h.MinReadShardsX, len(sortedVuids), tactic.N, tactic.M)
 						if len(sortedVuids) < tactic.N {
 							err = fmt.Errorf("broken %s", blob.ID())
-							span.Error(err)
+							spanpipe.Error(err)
 							ch <- pipeBuffer{err: err}
 							return
 						}
@@ -215,7 +220,7 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location proto.Location,
 
 					err = h.readOneBlob(ctx, getTime, serviceController, blob, sortedVuids, shards)
 					if err != nil {
-						span.Error("read one blob", blob.ID(), err)
+						spanpipe.Error("read one blob", blob.ID(), err)
 						for _, buf := range shards {
 							h.memPool.Put(buf)
 						}
@@ -258,7 +263,7 @@ func (h *Handler) Get(ctx context.Context, w io.Writer, location proto.Location,
 					continue
 				}
 
-				toRead := minU64(toReadSize, l-off)
+				toRead := util.Min(toReadSize, l-off)
 				if _, e := w.Write(buf[off : off+toRead]); e != nil {
 					err = errors.Info(e, "write to response")
 					break
@@ -506,6 +511,7 @@ func (h *Handler) readOneShard(ctx context.Context, serviceController controller
 			DiskID: vuid.diskID,
 			Vuid:   vuid.vuid,
 			Bid:    blob.Bid,
+			Type:   blobnode.ReadIO,
 		},
 		Offset: int64(shardOffset),
 		Size:   int64(shardReadSize),
@@ -607,12 +613,13 @@ func (h *Handler) getDataShardOnly(ctx context.Context, getTime *timeReadWrite,
 			break
 		}
 
-		toReadSize := minU64(remainSize, uint64(shardSize-shardOffset))
+		toReadSize := util.Min(remainSize, uint64(shardSize-shardOffset))
 		args := blobnode.RangeGetShardArgs{
 			GetShardArgs: blobnode.GetShardArgs{
 				DiskID: shard.DiskID,
 				Vuid:   shard.Vuid,
 				Bid:    blob.Bid,
+				Type:   blobnode.ReadIO,
 			},
 			Offset: int64(shardOffset),
 			Size:   int64(toReadSize),
@@ -687,16 +694,7 @@ func (h *Handler) getOneShardFromHost(ctx context.Context, serviceController con
 			}
 		}
 
-		ctxChild := ctx
-		if cancelChan != nil { // cancelChan == nil means reading data shard only
-			// new child span to get from blobnode, we should finish it here.
-			var spanChild trace.Span
-			spanChild, ctxChild = trace.StartSpanFromContextWithTraceID(
-				context.Background(), "GetFromBlobnode", span.TraceID())
-			defer spanChild.Finish()
-		}
-
-		body, crc, err := h.blobnodeClient.RangeGetShard(ctxChild, host, &args)
+		body, crc, err := h.blobnodeClient.RangeGetShard(ctx, host, &args)
 		if err == nil {
 			rbody = body
 			rcrc = crc
@@ -791,10 +789,10 @@ func genLocationBlobs(location *proto.Location, readSize uint64, offset uint64) 
 			}
 
 			if idx >= firstBlobIdx {
-				toReadSize := minU64(remainSize, blobSize-blobOffset)
+				toReadSize := util.Min(remainSize, blobSize-blobOffset)
 				if toReadSize > 0 {
 					// update the last blob size
-					fixedBlobSize := minU64(location.Size_-idx*blobSize, blobSize)
+					fixedBlobSize := util.Min(location.Size_-idx*blobSize, blobSize)
 
 					sizes, _ := ec.GetBufferSizes(int(fixedBlobSize), tactic)
 					shardSize := sizes.ShardSize
@@ -905,7 +903,7 @@ func emptyDataShardIndexes(sizes ec.BufferSizes) map[int]struct{} {
 	firstEmptyIdx := (sizes.DataSize + sizes.ShardSize - 1) / sizes.ShardSize
 	n := sizes.ECDataSize / sizes.ShardSize
 	if firstEmptyIdx >= n {
-		return make(map[int]struct{})
+		return nil
 	}
 
 	set := make(map[int]struct{}, n-firstEmptyIdx)

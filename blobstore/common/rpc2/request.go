@@ -37,7 +37,8 @@ type Request struct {
 	opts   []OptionRequest
 	conn   *transport.Stream
 
-	checksum ChecksumBlock
+	checksum    ChecksumBlock
+	bodyAligned bool
 
 	// server side
 	cancel       context.CancelFunc
@@ -113,29 +114,53 @@ func (req *Request) write(deadline time.Time) error {
 	var cell headerCell
 	cell.Set(reqHeaderSize)
 	encodeLen := req.checksum.EncodeSize(req.ContentLength)
-	size := _headerCell + reqHeaderSize + int(encodeLen) + req.Trailer.AllSize()
+
+	tr := req.trailerReader()
+	var mr io.Reader
 
 	req.conn.SetDeadline(deadline)
-	_, err := req.conn.SizedWrite(req.ctx, io.MultiReader(
-		codec2CellReader(cell, &req.RequestHeader),
-		io.LimitReader(req.Body, encodeLen), // the body was encoded
-		req.trailerReader(),
-	), size)
+	if req.bodyAligned {
+		if _, err := req.conn.SizedWrite(req.ctx,
+			codec2CellReader(cell, &req.RequestHeader),
+			_headerCell+reqHeaderSize); err != nil {
+			return err
+		}
+		if tr == nil {
+			mr = req.Body
+		} else {
+			mr = io.MultiReader(io.LimitReader(req.Body, encodeLen), tr)
+		}
+		if _, err := req.conn.SizedWrite(req.ctx, mr,
+			int(encodeLen)+req.Trailer.AllSize()); err != nil {
+			return err
+		}
+		return nil
+	}
+	if tr == nil {
+		mr = io.MultiReader(codec2CellReader(cell, &req.RequestHeader), req.Body)
+	} else {
+		mr = io.MultiReader(codec2CellReader(cell, &req.RequestHeader),
+			io.LimitReader(req.Body, encodeLen), tr) // the body was encoded
+	}
+
+	size := _headerCell + reqHeaderSize + int(encodeLen) + req.Trailer.AllSize()
+	_, err := req.conn.SizedWrite(req.ctx, mr, size)
 	return err
 }
 
-func (req *Request) request(deadline time.Time) (*Response, error) {
+func (req *Request) request(deadline time.Time) (*Response, bool, error) {
 	if err := req.write(deadline); err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	resp := &Response{Request: req}
 	frame, err := readHeaderFrame(req.ctx, req.conn, &resp.ResponseHeader)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	if resp.Status < 200 || resp.Status >= 300 {
 		frame.Close()
-		return nil, NewError(resp.Status, resp.Reason, resp.Error)
+		// set the stream broken if it has body
+		return nil, resp.ContentLength > 0, NewError(resp.Status, resp.Reason, resp.Error)
 	}
 
 	decode := req.checksum != ChecksumBlock{} && req.checksum.Direction.IsDownload()
@@ -147,10 +172,13 @@ func (req *Request) request(deadline time.Time) (*Response, error) {
 	}
 	resp.Body = makeBodyWithTrailer(req.conn.NewSizedReader(req.ctx, payloadSize, frame),
 		req, &resp.Trailer, resp.ContentLength, decode)
-	return resp, nil
+	return resp, false, nil
 }
 
 func (req *Request) trailerReader() io.Reader {
+	if req.AfterBody == nil && req.Trailer.AllSize() == 0 {
+		return nil
+	}
 	return &trailerReader{
 		Fn:      req.AfterBody,
 		Trailer: &req.Trailer,
@@ -175,6 +203,9 @@ func (req *Request) OptionCrcUpload() *Request   { return req.optionCrc(Checksum
 func (req *Request) OptionCrcDownload() *Request { return req.optionCrc(ChecksumDirection_Download) }
 
 func (req *Request) OptionChecksum(block ChecksumBlock) *Request {
+	if block.BlockSize%transport.Alignment != 0 || algorithmSizes[block.Algorithm] > _checksumAlignment {
+		panic(fmt.Sprintf("rpc2: checksum(%s) block size is not aligned", block.String()))
+	}
 	if _, exist := algorithms[block.Algorithm]; !exist || block.BlockSize == 0 {
 		panic(fmt.Sprintf("rpc2: checksum(%s) not implements", block.String()))
 	}
@@ -192,18 +223,35 @@ func (req *Request) OptionChecksum(block ChecksumBlock) *Request {
 		return req
 	}
 
-	req.opts = append(req.opts, func(r *Request) {
-		r.Body = newEdBody(block, r.Body, int(req.ContentLength), true)
-		if getBody := r.GetBody; getBody != nil {
-			r.GetBody = func() (io.ReadCloser, error) {
-				body, err := getBody()
-				if err != nil {
-					return nil, err
-				}
-				return newEdBody(block, clientNopBody(body), int(req.ContentLength), true), nil
+	req.opts = append(req.opts, req.optChecksum)
+	return req
+}
+
+func (req *Request) optChecksum(r *Request) {
+	r.Body = newEdBody(r.checksum, r.Body, int(req.ContentLength), true)
+	if getBody := r.GetBody; getBody != nil {
+		r.GetBody = func() (io.ReadCloser, error) {
+			body, err := getBody()
+			if err != nil {
+				return nil, err
 			}
+			return newEdBody(r.checksum, clientNopBody(body), int(req.ContentLength), true), nil
 		}
-	})
+	}
+}
+
+func (req *Request) OptionBodyAligned() *Request {
+	req.OptionBodyAlignedUpload()
+	return req.OptionBodyAlignedDownload()
+}
+
+func (req *Request) OptionBodyAlignedUpload() *Request {
+	req.bodyAligned = true
+	return req
+}
+
+func (req *Request) OptionBodyAlignedDownload() *Request {
+	req.Header.Set(HeaderInternalBodyAligned, "1")
 	return req
 }
 
@@ -241,31 +289,17 @@ func getRequest() *Request {
 }
 
 func putRequest(req *Request) {
-	req.StreamCmd = StreamCmd_NOT
-	req.RemotePath = ""
-	req.TraceID = ""
-	req.ContentLength = 0
 	req.Header.Renew()
 	req.Trailer.Renew()
-	req.Parameter = req.Parameter[:0]
-
-	req.RemoteAddr = ""
-	req.BodyRead = 0
-
-	req.ctx = nil
-	req.client = nil
-	req.opts = req.opts[:0]
-	req.conn = nil
-
-	req.checksum = ChecksumBlock{}
-
-	req.cancel = nil
-	req.stream = nil
-	req.readablePara = false
-
-	req.Body = nil
-	req.GetBody = nil
-	req.AfterBody = nil
-
+	*req = Request{
+		RequestHeader: RequestHeader{
+			Version:   req.Version,
+			Magic:     req.Magic,
+			Header:    req.Header,
+			Trailer:   req.Trailer,
+			Parameter: req.Parameter[:0],
+		},
+		opts: req.opts[:0],
+	}
 	poolRequest.Put(req) // nolint: staticcheck
 }

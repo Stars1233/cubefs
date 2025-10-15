@@ -17,6 +17,7 @@ package chunk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"path/filepath"
 	"runtime"
@@ -27,7 +28,6 @@ import (
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/blobnode/base"
-	"github.com/cubefs/cubefs/blobstore/blobnode/base/qos"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core/storage"
 	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
@@ -35,7 +35,6 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/limit"
 	"github.com/cubefs/cubefs/blobstore/util/limit/keycount"
-	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
 const (
@@ -85,7 +84,7 @@ type chunk struct {
 	lastModifyTime int64
 
 	// io schedulers
-	ioPools map[qos.IOTypeRW]taskpool.IoPool
+	ioPools map[bnapi.IOType]base.IoPool
 }
 
 type FileInfo struct {
@@ -95,7 +94,7 @@ type FileInfo struct {
 	Size  uint64 `json:"size"`  // Chunk File Size ( file logic size)
 }
 
-func newChunkStorage(ctx context.Context, dataPath string, vm core.VuidMeta, ioPools map[qos.IOTypeRW]taskpool.IoPool, opts ...core.OptionFunc) (
+func newChunkStorage(ctx context.Context, dataPath string, vm core.VuidMeta, ioPools map[bnapi.IOType]base.IoPool, opts ...core.OptionFunc) (
 	cs *chunk, err error,
 ) {
 	span := trace.SpanFromContextSafe(ctx)
@@ -157,7 +156,7 @@ func newChunkStorage(ctx context.Context, dataPath string, vm core.VuidMeta, ioP
 	return cs, err
 }
 
-func NewChunkStorage(ctx context.Context, dataPath string, vm core.VuidMeta, ioPools map[qos.IOTypeRW]taskpool.IoPool, opts ...core.OptionFunc) (
+func NewChunkStorage(ctx context.Context, dataPath string, vm core.VuidMeta, ioPools map[bnapi.IOType]base.IoPool, opts ...core.OptionFunc) (
 	cs *Chunk, err error,
 ) {
 	c, err := newChunkStorage(ctx, dataPath, vm, ioPools, opts...)
@@ -290,7 +289,9 @@ func (cs *chunk) Write(ctx context.Context, b *core.Shard) (err error) {
 	}
 
 	// update stats
-	atomic.AddUint64(&cs.fileInfo.Used, uint64(core.Alignphysize(int64(b.Size))))
+	if !(b.Inline || b.NopData) {
+		atomic.AddUint64(&cs.fileInfo.Used, uint64(core.Alignphysize(int64(b.Size))))
+	}
 	atomic.StoreUint32(&cs.dirty, 1)
 
 	return nil
@@ -468,6 +469,52 @@ func (cs *chunk) Read(ctx context.Context, b *core.Shard) (n int64, err error) {
 	return cs.rangeRead(ctx, stg, b, m)
 }
 
+func (cs *chunk) BatchRead(ctx context.Context, s *core.BatchShard) (n int64, err error) {
+	// statistics
+	cs.stats.readBefore()
+
+	stg := cs.GetStg()
+	defer cs.PutStg(stg)
+
+	rc, err := stg.NewBatchReader(ctx, s)
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+
+	// begin io
+	if s.PrepareHook != nil {
+		s.PrepareHook(s)
+	}
+
+	// after io
+	if s.AfterHook != nil {
+		defer s.AfterHook(s)
+	}
+
+	tw := base.NewTimeWriter(s.Writer)
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+	n, err = rc.WriteTo(tw)
+	span := trace.SpanFromContextSafe(ctx)
+	span.AppendTrackLogWithDuration("net.w", tw.Duration(), err)
+	if tr, ok := rc.(interface{ Duration() time.Duration }); ok {
+		span.AppendTrackLogWithDuration("dat.r", tr.Duration(), err)
+	}
+	if err != nil {
+		return n, err
+	}
+	if n != s.Size {
+		return n, io.ErrShortWrite
+	}
+
+	return n, nil
+}
+
 /*
 Need Shard:
   - From 		(may fix)
@@ -543,6 +590,10 @@ func (cs *chunk) rangeRead(ctx context.Context, stg core.Storage, s *core.Shard,
 	span.AppendTrackLogWithDuration("net.w", tw.Duration(), err)
 	span.AppendTrackLogWithDuration("dat.r", tr.Duration(), err)
 	if err != nil {
+		// prevent 5xx error code
+		if errors.Is(err, context.Canceled) {
+			err = bloberr.ErrIOCtxCancel
+		}
 		return n, err
 	}
 
@@ -570,7 +621,7 @@ func (cs *chunk) MarkDelete(ctx context.Context, bid proto.BlobID) (err error) {
 
 	err = stg.MarkDelete(ctx, bid)
 	if err != nil {
-		span.Errorf("Failed mark delete bid:%d, err:%v", bid, err)
+		span.Errorf("Failed mark delete: diskID:%d, vuid:%d, bid:%d, err:%v", cs.diskID, cs.vuid, bid, err)
 		return err
 	}
 
@@ -598,12 +649,14 @@ func (cs *chunk) Delete(ctx context.Context, bid proto.BlobID) (err error) {
 
 	n, err := stg.Delete(ctx, bid)
 	if err != nil {
-		span.Errorf("Failed delete, bid:%v, err:%v", bid, err)
+		span.Errorf("Failed delete: diskID:%d, vuid:%d, bid:%d, err:%v", cs.diskID, cs.vuid, bid, err)
 		return err
 	}
 
 	// update stats
-	atomic.AddUint64(&cs.fileInfo.Used, -uint64(core.Alignphysize(n)))
+	if n > 0 {
+		atomic.AddUint64(&cs.fileInfo.Used, -uint64(core.Alignphysize(n)))
+	}
 	atomic.StoreUint32(&cs.dirty, 1)
 
 	return nil
@@ -624,7 +677,7 @@ func (cs *chunk) ReadShardMeta(ctx context.Context, bid proto.BlobID) (sm *core.
 
 	shard, err := stg.ReadShardMeta(ctx, bid)
 	if err != nil {
-		span.Errorf("Failed read shardmeta bid:%d, err:%v", bid, err)
+		span.Errorf("Failed read shardmeta: diskID:%d, vuid:%d, bid:%d, err:%v", cs.diskID, cs.vuid, bid, err)
 		return nil, err
 	}
 
@@ -661,6 +714,9 @@ func (cs *chunk) ListShards(ctx context.Context, startBid proto.BlobID, cnt int,
 			Crc:    shard.Crc,
 			Flag:   shard.Flag,
 			Inline: shard.Inline,
+			Offset: shard.Offset,
+
+			NopData: shard.NopData,
 		})
 
 		next = bid
@@ -678,7 +734,7 @@ func (cs *chunk) ListShards(ctx context.Context, startBid proto.BlobID, cnt int,
 			span.Debugf("finished scan shard info: err: %v", err)
 			return
 		}
-		span.Errorf("scan vuid:%v shard occur error: %v", cs.vuid, err)
+		span.Errorf("scan diskID:%d vuid:%d shard occur error: %v", cs.diskID, cs.vuid, err)
 		return nil, proto.InValidBlobID, err
 	}
 

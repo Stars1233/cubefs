@@ -18,9 +18,11 @@ package shardnode
 import (
 	"context"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
+	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	shardnodeapi "github.com/cubefs/cubefs/blobstore/api/shardnode"
 	"github.com/cubefs/cubefs/blobstore/cmd"
@@ -29,14 +31,24 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/raft"
 	"github.com/cubefs/cubefs/blobstore/common/rpc2"
 	"github.com/cubefs/cubefs/blobstore/common/security"
+	"github.com/cubefs/cubefs/blobstore/common/taskswitch"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/shardnode/base"
+	"github.com/cubefs/cubefs/blobstore/shardnode/blobdeleter"
 	"github.com/cubefs/cubefs/blobstore/shardnode/catalog"
 	"github.com/cubefs/cubefs/blobstore/shardnode/storage"
 	"github.com/cubefs/cubefs/blobstore/shardnode/storage/store"
 	"github.com/cubefs/cubefs/blobstore/util/closer"
 	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
+
+var (
+	globalService *service
+	conf          Config
+)
+
+// singleton service instance control
+var serviceOnce sync.Once
 
 const defaultTaskPoolSize = 64
 
@@ -72,18 +84,38 @@ type Config struct {
 	WaitRepairCloseDiskIntervalS int64 `json:"wait_repair_close_disk_interval_s"`
 	WaitReOpenDiskIntervalS      int64 `json:"wait_re_open_disk_interval_s"`
 	ShardCheckAndClearIntervalH  int64 `json:"shard_check_and_clear_interval_h"`
+
+	DeleteBlobCfg blobdeleter.BlobDelCfg `json:"blob_delete_cfg"`
 }
 
+// newService returns the singleton service instance
 func newService(cfg *Config) *service {
+	serviceOnce.Do(func() {
+		globalService = createService(cfg)
+	})
+	return globalService
+}
+
+// createService creates a new service instance
+func createService(cfg *Config) *service {
 	span, ctx := trace.StartSpanFromContext(context.Background(), "NewShardNodeService")
 
 	security.InitWithRegionMagic(cfg.RegionMagic)
 	initServiceConfig(cfg)
 	cmClient := cmapi.New(&cfg.CmConfig)
+	if err := cmapi.LoadExtendCodemode(context.Background(), cmClient); err != nil {
+		span.Fatalf("load extend codemod failed: %s", err)
+	}
+
 	snClient := shardnodeapi.New(rpc2.Client{RetryOn: func(err error) bool {
 		return rpc2.DetectStatusCode(err) < apierr.CodeShardNodeNotLeader
 	}})
-	transport := base.NewTransport(cmClient, snClient, &cfg.NodeConfig)
+	transport := base.NewTransport(base.TransportConfig{
+		CMClient: cmClient,
+		SNClient: snClient,
+		BNClient: bnapi.New(&bnapi.Config{}),
+		Self:     &cfg.NodeConfig,
+	})
 	cfg.ShardBaseConfig.Transport = transport
 
 	// set raft config
@@ -135,6 +167,21 @@ func newService(cfg *Config) *service {
 		},
 	})
 	svr.catalog = c
+
+	cfg.DeleteBlobCfg.ClusterID = cfg.NodeConfig.ClusterID
+	taskSwitchMgr := taskswitch.NewSwitchMgr(cmClient)
+	dm, err := blobdeleter.NewBlobDeleteMgr(&blobdeleter.BlobDelMgrConfig{
+		TaskSwitchMgr: taskSwitchMgr,
+		ShardGetter:   svr,
+		Transport:     transport,
+		VolCache:      base.NewVolumeCache(transport, 10*time.Second),
+		BlobDelCfg:    cfg.DeleteBlobCfg,
+	})
+	if err != nil {
+		span.Fatalf("new blob delete mgr failed, err: %s", err.Error())
+	}
+	svr.blobDelMgr = dm
+
 	go svr.loop(ctx)
 	span.Infof("service started success")
 
@@ -147,6 +194,8 @@ type service struct {
 	transport base.Transport
 	taskPool  taskpool.TaskPool
 	groupRun  singleflight.Group
+
+	blobDelMgr *blobdeleter.BlobDeleteMgr
 
 	cfg    Config
 	lock   sync.RWMutex
@@ -182,5 +231,6 @@ func (s *service) getAllDisks() []*storage.Disk {
 
 func (s *service) close() {
 	s.closer.Close()
+	s.blobDelMgr.Close()
 	s.cfg.RaftConfig.Transport.Close()
 }

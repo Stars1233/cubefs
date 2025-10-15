@@ -128,19 +128,8 @@ type delBlobRet struct {
 	err    error
 }
 
-// DelDoc is a delete doc information for logging in dellog
-type DelDoc struct {
-	ClusterID     proto.ClusterID `json:"cid"`
-	Bid           proto.BlobID    `json:"bid"`
-	Vid           proto.Vid       `json:"vid"`
-	Retry         int             `json:"retry"`
-	Time          int64           `json:"t"`
-	ReqID         string          `json:"rid"`
-	ActualDelTime int64           `json:"del_at"` // unix time in S
-}
-
-func toDelDoc(msg proto.DeleteMsg) DelDoc {
-	return DelDoc{
+func toDelDoc(msg proto.DeleteMsg) proto.DelDoc {
+	return proto.DelDoc{
 		ClusterID:     msg.ClusterID,
 		Bid:           msg.Bid,
 		Vid:           msg.Vid,
@@ -505,11 +494,18 @@ func (mgr *BlobDeleteMgr) consume(item *delBlobRet, consumerPause base.ConsumerP
 
 	// if message retry times is greater than MessagePunishThreshold while sleep MessagePunishTimeM minutes
 	if item.delMsg.Retry >= mgr.cfg.MessagePunishThreshold {
-		span.Warnf("punish message for a while: until[%+v], sleep[%+v], retry[%d]",
-			time.Now().Add(mgr.punishTime), mgr.punishTime, item.delMsg.Retry)
-		if ok := sleep(mgr.punishTime, consumerPause); !ok {
-			item.status = DeleteStatusUndo
-			return
+		delta := time.Since(time.Unix(item.delMsg.FailTime, 0))
+		if item.delMsg.FailTime == 0 {
+			delta = 0
+		}
+		if delta < mgr.punishTime {
+			toSleep := mgr.punishTime - delta
+			span.Warnf("punish message for a while: until[%+v], sleep[%+v], retry[%d]",
+				time.Now().Add(toSleep), toSleep, item.delMsg.Retry)
+			if ok := sleep(toSleep, consumerPause); !ok {
+				item.status = DeleteStatusUndo
+				return
+			}
 		}
 	}
 	now := time.Now().UTC()
@@ -614,7 +610,13 @@ func (mgr *BlobDeleteMgr) deleteShards(
 				err = ret.err
 				continue
 			}
-
+			if mgr.shouldUpdateVolume(volInfo) {
+				span.Warnf("delete shard failed should update volume: bid[%d], vuid[%d], markDelete[%+v], code[%d], err[%+v]",
+					bid, ret.vuid, markDelete, errCode, ret.err)
+				updateAndRetryShards = append(updateAndRetryShards, ret.vuid)
+				err = ret.err
+				continue
+			}
 			if errCode == errcode.CodeChunkCompacting || errCode == errcode.CodeVUIDReadonly {
 				span.Warnf("delete shard failed: bid[%d], vuid[%d], markDelete[%+v], code[%d], err[%+v]",
 					bid, ret.vuid, markDelete, errCode, ret.err)
@@ -716,6 +718,7 @@ func (mgr *BlobDeleteMgr) send2FailQueue(ctx context.Context, msg *proto.DeleteM
 	span.Debugf("send to fail queue: bid[%d], try[%d], delete stages[%+v]", msg.Bid, msg.Retry, msg.BlobDelStages)
 
 	msg.Retry++
+	msg.FailTime = time.Now().Unix()
 	b, err := json.Marshal(msg)
 	if err != nil {
 		// just panic if marsh fail
@@ -762,6 +765,18 @@ func (mgr *BlobDeleteMgr) hasBrokenDisk(vid proto.Vid) bool {
 	}
 	for _, unit := range volume.VunitLocations {
 		if mgr.clusterTopology.IsBrokenDisk(unit.DiskID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (mgr *BlobDeleteMgr) shouldUpdateVolume(volume *client.VolumeInfoSimple) bool {
+	for _, unit := range volume.VunitLocations {
+		if mgr.clusterTopology.IsBrokenDisk(unit.DiskID) {
+			continue
+		}
+		if _, ok := mgr.clusterTopology.GetDisk(unit.DiskID); !ok {
 			return true
 		}
 	}

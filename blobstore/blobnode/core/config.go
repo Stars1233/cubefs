@@ -44,9 +44,17 @@ const (
 	DefaultMetricReportIntervalS        = int64(300)            // 300 Sec
 	DefaultBlockBufferSize              = int64(64 * 1024)      // 64k
 	DefaultCompactEmptyRateThreshold    = float64(0.8)          // 80% rate
+	DefaultBatchReadBufferSize          = int64(1024 * 1024)    // 1 MB
+	DefaultBatchReadHoleThreshold       = int64(256 * 1024)     // hole data in batch)
+	defaultWaitPendingReqIntervalSec    = int64(10)
 	defaultWriteThreadCnt               = 4
 	defaultReadThreadCnt                = 4
-	defaultDeleteThreadCnt              = 1
+	defaultDeleteThreadCnt              = 2
+	defaultBackgroundThreadCnt          = 2
+	defaultWriteQueueDepth              = 64
+	defaultReadQueueDepth               = 64
+	defaultDeleteQueueDepth             = 32
+	defaultBackgroundQueueDepth         = 32
 )
 
 // Config for disk
@@ -78,15 +86,23 @@ type RuntimeConfig struct {
 	MustMountPoint               bool    `json:"must_mount_point"`
 	IOStatFileDryRun             bool    `json:"iostat_file_dryrun"`
 	SetDefaultSwitch             bool    `json:"set_default_switch"`
+	EnableDeleteShardVerify      bool    `json:"enable_delete_shard_verify"`
 	CompactBatchSize             int     `json:"compact_batch_size"`
+	WaitPendingReqIntervalSec    int64   `json:"wait_pending_req_interval_sec"`
 	MetricReportIntervalS        int64   `json:"metric_report_interval_S"`
 	BlockBufferSize              int64   `json:"block_buffer_size"`
-	WriteThreadCnt               int     `json:"write_thread_cnt"`
-	ReadThreadCnt                int     `json:"read_thread_cnt"`
-	DeleteThreadCnt              int     `json:"delete_thread_cnt"`
-	EnableDeleteShardVerify      bool    `json:"enable_delete_shard_verify"`
+	BatchBufferSize              int64   `json:"batch_buffer_size"`
+	BatchBufferHoleThreshold     int64   `json:"batch_buffer_hole_threshold"`
 
-	DataQos qos.Config `json:"data_qos"`
+	WriteThreadCnt       int        `json:"write_thread_cnt"`
+	ReadThreadCnt        int        `json:"read_thread_cnt"`
+	DeleteThreadCnt      int        `json:"delete_thread_cnt"`
+	BackgroundThreadCnt  int        `json:"background_thread_cnt"`
+	WriteQueueDepth      int        `json:"write_queue_depth"`
+	ReadQueueDepth       int        `json:"read_queue_depth"`
+	DeleteQueueDepth     int        `json:"delete_queue_depth"`
+	BackgroundQueueDepth int        `json:"background_queue_depth"`
+	DataQos              qos.Config `json:"data_qos"`
 }
 
 type HostInfo struct {
@@ -96,7 +112,6 @@ type HostInfo struct {
 	Host      string          `json:"host"`
 	DiskType  proto.DiskType  `json:"disk_type,omitempty"` // On a node, there is only one type of disk, and no other types
 	NodeID    proto.NodeID    `json:"-"`                   // A node is a process
-	ReAddDisk bool            `json:"re_add_disk"`         // need to re-register all disks under the node. temp switch
 }
 
 type Config struct {
@@ -135,6 +150,8 @@ func InitConfig(conf *Config) error {
 	defaulter.LessOrEqual(&conf.CompactMinSizeThreshold, DefaultCompactMinSizeThreshold)
 	defaulter.LessOrEqual(&conf.CompactEmptyRateThreshold, DefaultCompactEmptyRateThreshold)
 	defaulter.LessOrEqual(&conf.CompactBatchSize, DefaultCompactBatchSize)
+	defaulter.LessOrEqual(&conf.BatchBufferSize, DefaultBatchReadBufferSize)
+	defaulter.LessOrEqual(&conf.BatchBufferHoleThreshold, DefaultBatchReadHoleThreshold)
 	defaulter.LessOrEqual(&conf.BlockBufferSize, DefaultBlockBufferSize)
 
 	defaulter.LessOrEqual(&conf.ChunkCleanIntervalSec, DefaultChunkCleanIntervalSec)
@@ -142,20 +159,22 @@ func InitConfig(conf *Config) error {
 	defaulter.LessOrEqual(&conf.DiskCleanTrashIntervalSec, DefaultDiskCleanTrashIntervalSec)
 	defaulter.LessOrEqual(&conf.DiskTrashProtectionM, DefaultDiskTrashProtectionM)
 	defaulter.LessOrEqual(&conf.MetricReportIntervalS, DefaultMetricReportIntervalS)
+	defaulter.LessOrEqual(&conf.WaitPendingReqIntervalSec, defaultWaitPendingReqIntervalSec)
 	if conf.SetDefaultSwitch {
 		conf.NeedCompactCheck = true
 		conf.AllowForceCompact = true
 		conf.AllowCleanTrash = true
 	}
 
-	defaulter.LessOrEqual(&conf.WriteThreadCnt, defaultWriteThreadCnt)
-	defaulter.LessOrEqual(&conf.ReadThreadCnt, defaultReadThreadCnt)
-	defaulter.LessOrEqual(&conf.DeleteThreadCnt, defaultDeleteThreadCnt)
-
-	conf.DataQos.WriteChanQueCnt = int32(conf.WriteThreadCnt)
-	qos.InitAndFixQosConfig(&conf.DataQos)
-
-	return nil
+	defaulter.Equal(&conf.WriteThreadCnt, defaultWriteThreadCnt)
+	defaulter.Equal(&conf.ReadThreadCnt, defaultReadThreadCnt)
+	defaulter.Equal(&conf.DeleteThreadCnt, defaultDeleteThreadCnt)
+	defaulter.Equal(&conf.BackgroundThreadCnt, defaultBackgroundThreadCnt)
+	defaulter.LessOrEqual(&conf.WriteQueueDepth, defaultWriteQueueDepth)
+	defaulter.LessOrEqual(&conf.ReadQueueDepth, defaultReadQueueDepth)
+	defaulter.LessOrEqual(&conf.DeleteQueueDepth, defaultDeleteQueueDepth)
+	defaulter.LessOrEqual(&conf.BackgroundQueueDepth, defaultBackgroundQueueDepth)
+	return qos.FixQosConfigOnInit(&conf.DataQos)
 }
 
 func CheckNodeConf(conf *HostInfo) error {

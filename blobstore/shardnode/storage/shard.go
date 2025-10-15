@@ -29,7 +29,6 @@ import (
 	kvstore "github.com/cubefs/cubefs/blobstore/common/kvstorev2"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/raft"
-	"github.com/cubefs/cubefs/blobstore/common/rpc"
 	"github.com/cubefs/cubefs/blobstore/common/rpc2"
 	"github.com/cubefs/cubefs/blobstore/common/sharding"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
@@ -57,10 +56,40 @@ type ValGetter interface {
 }
 
 type (
+	batchItemOp   uint8
+	BatchItemElem struct {
+		opType batchItemOp
+		shardnode.Item
+	}
+)
+
+const (
+	batchItemOpInsert = iota
+	batchItemOpUpdate
+	batchItemOpDelete
+)
+
+func NewBatchItemElemInsert(itm shardnode.Item) BatchItemElem {
+	return BatchItemElem{
+		opType: batchItemOpInsert,
+		Item:   itm,
+	}
+}
+
+func NewBatchItemElemDelete(id string) BatchItemElem {
+	return BatchItemElem{
+		opType: batchItemOpDelete,
+		Item: shardnode.Item{
+			ID: id,
+		},
+	}
+}
+
+type (
 	ShardBlobHandler interface {
 		CreateBlob(ctx context.Context, h OpHeader, name []byte, b proto.Blob) (proto.Blob, error)
 		UpdateBlob(ctx context.Context, h OpHeader, name []byte, b proto.Blob) error
-		DeleteBlob(ctx context.Context, h OpHeader, name []byte) error
+		DeleteBlob(ctx context.Context, h OpHeader, name []byte, items []shardnode.Item) error
 		GetBlob(ctx context.Context, h OpHeader, name []byte) (proto.Blob, error)
 		ListBlob(ctx context.Context, h OpHeader, prefix, marker []byte, count uint64) (blobs []proto.Blob, nextMarker []byte, err error)
 	}
@@ -71,6 +100,7 @@ type (
 		DeleteItem(ctx context.Context, h OpHeader, id []byte) error
 		GetItem(ctx context.Context, h OpHeader, id []byte) (shardnode.Item, error)
 		ListItem(ctx context.Context, h OpHeader, prefix, marker []byte, count uint64) (items []shardnode.Item, nextMarker []byte, err error)
+		BatchWriteItem(ctx context.Context, h OpHeader, elems []BatchItemElem, opts ...ShardOptionFunc) error
 	}
 	ShardHandler interface {
 		ShardItemHandler
@@ -80,12 +110,15 @@ type (
 		Checkpoint(ctx context.Context) error
 		Stats(ctx context.Context, readIndex bool) (shardnode.ShardStats, error)
 		GetSuid() proto.Suid
+		GetDiskID() proto.DiskID
 		GetUnits() []clustermgr.ShardUnit
 		CheckAndClearShard(ctx context.Context) error
+		ShardingSubRangeCount() int
+		IsLeader() bool
 	}
 	OpHeader struct {
 		RouteVersion proto.RouteVersion
-		ShardKeys    [][]byte
+		ShardKeys    []string
 	}
 
 	ShardBaseConfig struct {
@@ -184,7 +217,6 @@ type shard struct {
 		lastStableIndex    uint64
 		lastTruncatedIndex uint64
 	}
-
 	// add disk ref for finalizer gc
 	disk      *Disk
 	shardKeys *shardKeysGenerator
@@ -195,7 +227,6 @@ type shard struct {
 
 func (s *shard) InsertItem(ctx context.Context, h OpHeader, id []byte, i shardnode.Item) error {
 	span := trace.SpanFromContextSafe(ctx)
-
 	if !s.isLeader() {
 		return apierr.ErrShardNodeNotLeader
 	}
@@ -329,6 +360,53 @@ func (s *shard) DeleteItem(ctx context.Context, h OpHeader, id []byte) error {
 	return s.delete(ctx, h, s.shardKeys.encodeItemKey(id), raftOpDeleteItem)
 }
 
+func (s *shard) BatchWriteItem(ctx context.Context, h OpHeader, elems []BatchItemElem, opts ...ShardOptionFunc) error {
+	span := trace.SpanFromContextSafe(ctx)
+
+	opt := &shardOption{}
+	opt.applyOptions(opts)
+
+	if !opt.proposeAsFollower && !s.isLeader() {
+		return apierr.ErrShardNodeNotLeader
+	}
+	if err := s.checkShardOptHeader(h); err != nil {
+		return err
+	}
+	if err := s.shardState.prepRWCheck(ctx); err != nil {
+		return convertStoppingWriteErr(err)
+	}
+	defer s.shardState.prepRWCheckDone()
+
+	wb := s.store.KVStore().NewWriteBatch()
+	defer wb.Close()
+
+	for i := range elems {
+		switch elems[i].opType {
+		case batchItemOpInsert, batchItemOpUpdate:
+			raw, err := elems[i].Marshal()
+			if err != nil {
+				return err
+			}
+			wb.Put(dataCF, s.shardKeys.encodeItemKey([]byte(elems[i].ID)), raw)
+		case batchItemOpDelete:
+			wb.Delete(dataCF, s.shardKeys.encodeItemKey([]byte(elems[i].ID)))
+		default:
+			span.Panicf("unknown batch write item op")
+		}
+	}
+
+	proposalData := raft.ProposalData{
+		Op:   raftOpWriteBatchRaw,
+		Data: wb.Data(),
+	}
+	resp, err := s.raftGroup.Propose(ctx, &proposalData)
+	if err != nil {
+		return err
+	}
+	appendTrackLogAfterPropose(span, resp.Data)
+	return nil
+}
+
 func (s *shard) CreateBlob(ctx context.Context, h OpHeader, name []byte, b proto.Blob) (proto.Blob, error) {
 	span := trace.SpanFromContextSafe(ctx)
 
@@ -426,8 +504,36 @@ func (s *shard) ListBlob(ctx context.Context, h OpHeader, prefix, marker []byte,
 	return blobs, s.shardKeys.decodeBlobKey(nextMarker), err
 }
 
-func (s *shard) DeleteBlob(ctx context.Context, h OpHeader, name []byte) error {
-	return s.delete(ctx, h, s.shardKeys.encodeBlobKey(name), raftOpDeleteBlob)
+func (s *shard) DeleteBlob(ctx context.Context, h OpHeader, name []byte, items []shardnode.Item) error {
+	if !s.isLeader() {
+		return apierr.ErrShardNodeNotLeader
+	}
+	if err := s.checkShardOptHeader(h); err != nil {
+		return err
+	}
+	if err := s.shardState.prepRWCheck(ctx); err != nil {
+		return convertStoppingWriteErr(err)
+	}
+	defer s.shardState.prepRWCheckDone()
+
+	wb := s.store.KVStore().NewWriteBatch()
+	defer wb.Close()
+
+	// new delete messages
+	for i := range items {
+		itm := protoItemToInternalItem(items[i])
+		raw, err := itm.Marshal()
+		if err != nil {
+			return err
+		}
+		wb.Put(dataCF, s.shardKeys.encodeItemKey([]byte(itm.ID)), raw)
+	}
+
+	// delete meta
+	wb.Delete(dataCF, s.shardKeys.encodeBlobKey(name))
+
+	_, err := s.raftGroup.Propose(ctx, &raft.ProposalData{Op: raftOpWriteBatchRaw, Data: wb.Data()})
+	return err
 }
 
 func (s *shard) GetRouteVersion() proto.RouteVersion {
@@ -665,12 +771,14 @@ func (s *shard) DeleteShard(ctx context.Context, nodeHost string, clearData bool
 	if err != nil {
 		return err
 	}
-	// wait current shard apply member change done
+	// 1. shard raft group not removed, should wait current shard apply member change done
+	// 2. shard raft group has been removed(handle eio), can't apply any change, no need to wait
+	_, getGroupErr := s.disk.raftManager.GetRaftGroup(uint64(s.suid.ShardID()))
 	for {
-		if !s.isShardUnitExist(s.suid) {
-			time.Sleep(1 * time.Second)
+		if !s.isShardUnitExist(s.suid) || errors.Is(getGroupErr, raft.ErrGroupNotFound) {
 			break
 		}
+		time.Sleep(1 * time.Second)
 	}
 
 	span.Warnf("disk[%d] shard[%d] suid[%d] remove from members done", s.diskID, s.suid.ShardID(), s.suid)
@@ -744,9 +852,17 @@ func (s *shard) CheckAndClearShard(ctx context.Context) error {
 		if err == nil {
 			continue
 		}
-		if rpc.DetectStatusCode(err) != apierr.CodeShardNodeDiskNotFound {
-			return errors.Info(err, "get shard stats failed", u.DiskID, u.Suid)
+
+		// get target shardunit stats failed, check if the disk is repaired
+		repaired, err := s.cfg.Transport.IsRepairedDisk(ctx, u.DiskID)
+		if err != nil {
+			return errors.Info(err, "get disk info failed", u.DiskID)
 		}
+		if !repaired {
+			continue
+		}
+
+		// disk id is repaired, corresponding shard unit from shardinfo should be removed
 		err = s.UpdateShard(ctx, proto.ShardUpdateTypeRemoveMember, clustermgr.ShardUnit{
 			Suid:   u.Suid,
 			DiskID: u.DiskID,
@@ -754,7 +870,7 @@ func (s *shard) CheckAndClearShard(ctx context.Context) error {
 		if err != nil {
 			return errors.Info(err, "update shard failed", s.suid, u.DiskID)
 		}
-		span.Infof("remove shard[%d] suid[%d] from unit[%+v] done", s.suid.ShardID(), s.suid, u)
+		span.Infof("shard[%d] suid[%d] remove unit[%+v] done", s.suid.ShardID(), s.suid, u)
 		return err
 	}
 	return nil
@@ -784,6 +900,18 @@ func (s *shard) GetAppliedIndex() uint64 {
 
 func (s *shard) GetSuid() proto.Suid {
 	return s.suid
+}
+
+func (s *shard) ShardingSubRangeCount() int {
+	return len(s.shardInfoMu.shardInfo.Range.Subs)
+}
+
+func (s *shard) IsLeader() bool {
+	return s.isLeader()
+}
+
+func (s *shard) GetDiskID() proto.DiskID {
+	return s.diskID
 }
 
 func (s *shard) GetUnits() []clustermgr.ShardUnit {

@@ -22,20 +22,23 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/cubefs/cubefs/blobstore/common/errors"
-	"github.com/cubefs/cubefs/blobstore/common/iostat"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 )
 
 const _limited = "limited"
 
+type qosLimiter interface {
+	ReserveN(t time.Time, n int) *rate.Reservation
+}
+
 type rateLimiter struct {
-	readerAt   io.ReaderAt
-	reader     io.Reader
-	writer     io.Writer
-	writerAt   io.WriterAt
-	wAtCtx     iostat.WriterAtCtx
-	ctx        context.Context
-	bpsLimiter *rate.Limiter
+	readerAt io.ReaderAt
+	reader   io.Reader
+	writer   io.Writer
+	writerAt io.WriterAt
+	ctx      context.Context
+
+	ctrl qosLimiter
 }
 
 func (l *rateLimiter) Read(p []byte) (n int, err error) {
@@ -90,24 +93,13 @@ func (l *rateLimiter) WriteAt(p []byte, off int64) (n int, err error) {
 	return l.writerAt.WriteAt(p, off)
 }
 
-func (l *rateLimiter) WriteAtCtx(ctx context.Context, p []byte, off int64) (n int, err error) {
-	n, err = l.wAtCtx.WriteAtCtx(ctx, p, off)
-	if err != nil {
-		return
-	}
-	return n, l.doWithLimit(n)
-}
-
 func (l *rateLimiter) doWithLimit(n int) (err error) {
-	return l.doWithSingleLimit(l.bpsLimiter, n)
+	return l.doWithSingleLimit(n)
 }
 
-func (l *rateLimiter) doWithSingleLimit(limiter *rate.Limiter, n int) (err error) {
-	if limiter == nil {
-		return
-	}
+func (l *rateLimiter) doWithSingleLimit(n int) (err error) {
 	now := time.Now()
-	reserve := limiter.ReserveN(now, n)
+	reserve := l.ctrl.ReserveN(now, n)
 	if !reserve.OK() {
 		return errors.ErrSizeOverBurst
 	}

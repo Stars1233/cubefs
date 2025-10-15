@@ -25,6 +25,7 @@ import (
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/common/crc32block"
+	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 )
 
@@ -133,11 +134,12 @@ type ShardKey struct {
 type ShardMeta struct {
 	Version uint8
 	Flag    bnapi.ShardStatus
+	NopData bool
+	Inline  bool
 	Offset  int64
 	Size    uint32
 	Crc     uint32
 	Padding [8]byte
-	Inline  bool
 	Buffer  []byte
 }
 
@@ -151,8 +153,9 @@ type Shard struct {
 	Crc    uint32            // crc for shard data
 	Flag   bnapi.ShardStatus // shard status
 
-	Inline bool   // shard data inline
-	Buffer []byte // inline data
+	NopData bool   // shard data is all zero
+	Inline  bool   // shard data inline
+	Buffer  []byte // inline data
 
 	Body     io.Reader // for put: shard body
 	From, To int64     // for get: range (note: may fix in cs)
@@ -160,6 +163,19 @@ type Shard struct {
 
 	PrepareHook func(shard *Shard)
 	AfterHook   func(shard *Shard)
+}
+
+// BatchShard chunk batch read for background task
+type BatchShard struct {
+	Vuid proto.Vuid
+	Bids []bnapi.BidInfo
+	Size int64 // header + data
+
+	Writer     io.Writer
+	BufferSize int64
+
+	PrepareHook func(batch *BatchShard)
+	AfterHook   func(batch *BatchShard)
 }
 
 func (sm *ShardMeta) Marshal() ([]byte, error) {
@@ -175,6 +191,9 @@ func (sm *ShardMeta) Marshal() ([]byte, error) {
 	buf := make([]byte, bufLen)
 	buf[0] = sm.Version
 	buf[1] = uint8(sm.Flag)
+	if sm.NopData {
+		buf[1] = buf[1] | bnapi.ShardDataNop
+	}
 	if sm.Inline {
 		buf[1] = buf[1] | bnapi.ShardDataInline
 	}
@@ -206,6 +225,10 @@ func (sm *ShardMeta) Unmarshal(data []byte) error {
 
 	copy(sm.Padding[:], data[24:32])
 
+	sm.NopData = sm.Flag&bnapi.ShardDataNop != 0
+	if sm.NopData {
+		sm.Flag = sm.Flag &^ bnapi.ShardDataNop
+	}
 	sm.Inline = sm.Flag&bnapi.ShardDataInline != 0
 	if sm.Inline {
 		sm.Flag = sm.Flag &^ bnapi.ShardDataInline
@@ -312,6 +335,7 @@ func (b *Shard) FillMeta(meta ShardMeta) {
 	b.Crc = meta.Crc
 	b.Flag = meta.Flag
 
+	b.NopData = meta.NopData
 	b.Inline = meta.Inline
 	b.Buffer = meta.Buffer
 }
@@ -345,6 +369,30 @@ func NewShardReader(id proto.BlobID, vuid proto.Vuid, from int64, to int64, writ
 	s.init()
 
 	return s
+}
+
+func NewBatchShardReader(bids []bnapi.BidInfo, vuid proto.Vuid, writer io.Writer, bufferSize int64) (*BatchShard, error) {
+	s := new(BatchShard)
+	lastOff := int64(-1)
+	for _, bid := range bids {
+		if bid.Offset <= lastOff || bid.Size < 0 {
+			return nil, bloberr.ErrInvalidParam
+		}
+		lastOff = bid.Offset
+		s.Size += bid.Size
+		if bufferSize < Alignphysize(bid.Size) {
+			bufferSize = Alignphysize(bid.Size)
+		}
+	}
+	s.Size += int64(len(bids)) * bnapi.GetShardsHeaderSize
+
+	s.Bids = bids
+	s.Vuid = vuid
+	s.BufferSize = bufferSize
+
+	s.Writer = writer
+
+	return s, nil
 }
 
 func ShardCopy(src *Shard) (dest *Shard) {

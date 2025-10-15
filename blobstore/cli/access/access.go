@@ -20,6 +20,8 @@ import (
 	"github.com/desertbit/grumble"
 	"github.com/hashicorp/consul/api"
 
+	"github.com/cubefs/cubefs/blobstore/access/controller"
+	"github.com/cubefs/cubefs/blobstore/access/stream"
 	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/blobstore/cli/common"
 	"github.com/cubefs/cubefs/blobstore/cli/common/cfmt"
@@ -27,10 +29,51 @@ import (
 	"github.com/cubefs/cubefs/blobstore/cli/common/fmt"
 	"github.com/cubefs/cubefs/blobstore/cli/config"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
+	"github.com/cubefs/cubefs/blobstore/sdk"
+	"github.com/cubefs/cubefs/blobstore/util/log"
+)
+
+var (
+	_sdkclient    access.API
+	_accessclient access.API
 )
 
 func newAccessClient() (access.API, error) {
-	return access.New(access.Config{
+	if _sdkclient != nil {
+		return _sdkclient, nil
+	}
+	if _accessclient != nil {
+		return _accessclient, nil
+	}
+
+	var data []byte
+	var err error
+	if sdkpath := config.SDKConfigPath(); sdkpath != "" {
+		jc := struct {
+			Stream stream.StreamConfig `json:"stream"`
+			Limit  stream.LimitConfig  `json:"limit"`
+		}{}
+		data, err = os.ReadFile(sdkpath)
+		if err != nil {
+			return nil, err
+		}
+		if err = common.Unmarshal(data, &jc); err != nil {
+			return nil, err
+		}
+		sdkConfig := &sdk.Config{
+			StreamConfig:   jc.Stream,
+			Limit:          jc.Limit,
+			MaxSizePutOnce: config.AccessMaxSizePutOnce(),
+			MaxRetry:       config.AccessHostTryTimes(),
+		}
+		sdkConfig.LogConf.Level = log.Level(config.Get("Flag-Loglevel").(int))
+		if _sdkclient, err = sdk.New(sdkConfig); err != nil {
+			return nil, err
+		}
+		return _sdkclient, nil
+	}
+
+	if _accessclient, err = access.New(access.Config{
 		ConnMode:       access.RPCConnectMode(config.AccessConnMode()),
 		Consul:         access.ConsulConfig{Address: config.AccessConsulAddr()},
 		PriorityAddrs:  config.AccessPriorityAddrs(),
@@ -43,7 +86,10 @@ func newAccessClient() (access.API, error) {
 		HostTryTimes:       config.AccessHostTryTimes(),
 		FailRetryIntervalS: config.AccessFailRetryIntervalS(),
 		MaxFailsPeriodS:    config.AccessMaxFailsPeriodS(),
-	})
+	}); err != nil {
+		return nil, err
+	}
+	return _accessclient, nil
 }
 
 func readLocation(f grumble.FlagMap) (loc proto.Location, err error) {
@@ -100,14 +146,35 @@ func Register(app *grumble.App) {
 			if err != nil {
 				return err
 			}
-			fmt.Println("discovery access services on")
-			fmt.Println(common.Readable(services))
-			fmt.Println()
+			fmt.Println("discovery access services on:", config.AccessConsulAddr())
+			if flags.Vverbose(c.Flags) {
+				fmt.Println(common.Readable(services))
+			} else {
+				addresses := make([]string, 0, len(services))
+				for _, service := range services {
+					addresses = append(addresses, service.Service.Address)
+				}
+				fmt.Println(common.Readable(addresses))
+			}
 			return nil
+		},
+		Flags: func(f *grumble.Flags) {
+			flags.VverboseRegister(f)
 		},
 	}
 	app.AddCommand(accessCommand)
 
+	accessCommand.AddCommand(&grumble.Command{
+		Name: "writereadonly",
+		Help: "force write to readonly cluster",
+		Run: func(c *grumble.Context) error {
+			controller.ForceWriteReadonlyCluster = c.Flags.Bool("forcewrite")
+			return nil
+		},
+		Flags: func(f *grumble.Flags) {
+			f.BoolL("forcewrite", false, "force write to readonly cluster")
+		},
+	})
 	accessCommand.AddCommand(&grumble.Command{
 		Name: "put",
 		Help: "put file",

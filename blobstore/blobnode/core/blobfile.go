@@ -21,27 +21,30 @@ import (
 	"syscall"
 	"time"
 
+	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/blobnode/base"
-	"github.com/cubefs/cubefs/blobstore/blobnode/base/qos"
 	"github.com/cubefs/cubefs/blobstore/blobnode/sys"
 	"github.com/cubefs/cubefs/blobstore/util/mergetask"
-	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
-type RawFile interface {
+type baseFile interface {
 	Name() string
 	Fd() uintptr
-	ReadAt(b []byte, off int64) (n int, err error)
-	WriteAt(b []byte, off int64) (n int, err error)
 	Stat() (info os.FileInfo, err error)
 	Sync() error
 	Close() error
 }
 
+type RawFile interface {
+	baseFile
+	ReadAt(b []byte, off int64) (n int, err error)
+	WriteAt(b []byte, off int64) (n int, err error)
+}
+
 type BlobFile interface {
-	RawFile
-	ReadAtCtx(ctx context.Context, b []byte, off int64) (n int, err error)
-	WriteAtCtx(ctx context.Context, b []byte, off int64) (n int, err error)
+	baseFile
+	base.CtxReaderAt
+	base.CtxWriterAt
 	Allocate(off int64, size int64) (err error)
 	Discard(off int64, size int64) (err error)
 	SysStat() (sysstat syscall.Stat_t, err error)
@@ -53,7 +56,7 @@ type blobFile struct {
 	syncHandler   *mergetask.MergeTask
 	handleIOError func(err error)
 
-	ioPools map[qos.IOTypeRW]taskpool.IoPool
+	ioPools map[bnapi.IOType]base.IoPool
 }
 
 func (ef *blobFile) Name() string {
@@ -64,67 +67,50 @@ func (ef *blobFile) Fd() uintptr {
 	return ef.file.Fd()
 }
 
-func (ef *blobFile) ReadAt(b []byte, off int64) (n int, err error) {
-	task := taskpool.IoPoolTaskArgs{
-		BucketId: ef.chunk,
-		Tm:       time.Now(),
-		TaskFn:   func() { n, err = ef.file.ReadAt(b, off) },
-	}
-	ef.ioPools[qos.IOTypeRead].Submit(task)
-
-	ef.handleError(err)
-	return
-}
-
-func (ef *blobFile) WriteAt(b []byte, off int64) (n int, err error) {
-	task := taskpool.IoPoolTaskArgs{
-		BucketId: ef.chunk,
-		Tm:       time.Now(),
-		TaskFn:   func() { n, err = ef.file.WriteAt(b, off) },
-	}
-	ef.ioPools[qos.IOTypeWrite].Submit(task)
-
-	ef.handleError(err)
-	return
-}
-
 func (ef *blobFile) ReadAtCtx(ctx context.Context, b []byte, off int64) (n int, err error) {
-	task := taskpool.IoPoolTaskArgs{
+	// If io ctx has been cancelled(ctx.Err() is not nil), we hope to return the error immediately
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
+	task := base.IoPoolTaskArgs{
 		BucketId: ef.chunk,
 		Tm:       time.Now(),
 		Ctx:      ctx,
-		TaskFn: func() {
-			select {
-			case <-ctx.Done():
+		TaskFn: func() error {
+			if ctx.Err() != nil {
 				n, err = 0, ctx.Err()
-				return
-			default:
+				return err
 			}
 			n, err = ef.file.ReadAt(b, off)
+			return err
 		},
 	}
-	ef.ioPools[qos.IOTypeRead].Submit(task)
+	err = ef.ioPools[bnapi.GetIoType(ctx)].Submit(task)
 
 	ef.handleError(err)
 	return
 }
 
 func (ef *blobFile) WriteAtCtx(ctx context.Context, b []byte, off int64) (n int, err error) {
-	task := taskpool.IoPoolTaskArgs{
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
+	task := base.IoPoolTaskArgs{
 		BucketId: ef.chunk,
 		Tm:       time.Now(),
 		Ctx:      ctx,
-		TaskFn: func() {
-			select {
-			case <-ctx.Done():
+		TaskFn: func() error {
+			if ctx.Err() != nil {
 				n, err = 0, ctx.Err()
-				return
-			default:
+				return err
 			}
 			n, err = ef.file.WriteAt(b, off)
+			return err
 		},
 	}
-	ef.ioPools[qos.IOTypeWrite].Submit(task)
+	err = ef.ioPools[bnapi.GetIoType(ctx)].Submit(task)
 
 	ef.handleError(err)
 	return
@@ -137,24 +123,24 @@ func (ef *blobFile) Stat() (info os.FileInfo, err error) {
 }
 
 func (ef *blobFile) Allocate(off int64, size int64) (err error) {
-	task := taskpool.IoPoolTaskArgs{
+	task := base.IoPoolTaskArgs{
 		BucketId: ef.chunk,
 		Tm:       time.Now(),
-		TaskFn:   func() { err = sys.PreAllocate(ef.file.Fd(), off, size) },
+		TaskFn:   func() error { return sys.PreAllocate(ef.file.Fd(), off, size) },
 	}
-	ef.ioPools[qos.IOTypeWrite].Submit(task)
+	err = ef.ioPools[bnapi.WriteIO].Submit(task)
 
 	ef.handleError(err)
 	return
 }
 
 func (ef *blobFile) Discard(off int64, size int64) (err error) {
-	task := taskpool.IoPoolTaskArgs{
+	task := base.IoPoolTaskArgs{
 		BucketId: ef.chunk,
 		Tm:       time.Now(),
-		TaskFn:   func() { err = sys.PunchHole(ef.file.Fd(), off, size) },
+		TaskFn:   func() error { return sys.PunchHole(ef.file.Fd(), off, size) },
 	}
-	ef.ioPools[qos.IOTypeDel].Submit(task)
+	err = ef.ioPools[bnapi.DeleteIO].Submit(task)
 
 	ef.handleError(err)
 	return
@@ -172,12 +158,12 @@ func (ef *blobFile) SysStat() (sysstat syscall.Stat_t, err error) {
 }
 
 func (ef *blobFile) Sync() (err error) {
-	task := taskpool.IoPoolTaskArgs{
+	task := base.IoPoolTaskArgs{
 		BucketId: ef.chunk,
 		Tm:       time.Now(),
-		TaskFn:   func() { err = ef.syncHandler.Do(nil) },
+		TaskFn:   func() error { return ef.syncHandler.Do(nil) },
 	}
-	ef.ioPools[qos.IOTypeWrite].Submit(task)
+	err = ef.ioPools[bnapi.WriteIO].Submit(task)
 
 	ef.handleError(err)
 	return err
@@ -223,7 +209,7 @@ func OpenFile(filename string, createIfMiss bool) (*os.File, error) {
 	return file, nil
 }
 
-func NewBlobFile(file RawFile, handleIOError func(err error), chunkId uint64, ioPools map[qos.IOTypeRW]taskpool.IoPool) BlobFile {
+func NewBlobFile(file RawFile, handleIOError func(err error), chunkId uint64, ioPools map[bnapi.IOType]base.IoPool) BlobFile {
 	ef := &blobFile{
 		file:          file,
 		chunk:         chunkId,

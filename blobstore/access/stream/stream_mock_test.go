@@ -14,9 +14,6 @@
 
 package stream
 
-// github.com/cubefs/cubefs/blobstore/access/... module access interfaces
-//go:generate mockgen -destination=./controller_mock_test.go -package=stream -mock_names ClusterController=MockClusterController,ServiceController=MockServiceController,VolumeGetter=MockVolumeGetter,IShardController=MockShardController,Shard=MockShard github.com/cubefs/cubefs/blobstore/access/controller ClusterController,ServiceController,VolumeGetter,IShardController,Shard
-
 import (
 	"bytes"
 	"context"
@@ -46,6 +43,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/testing/mocks"
 	_ "github.com/cubefs/cubefs/blobstore/testing/nolog"
+	"github.com/cubefs/cubefs/blobstore/util/bytespool"
 )
 
 var (
@@ -304,9 +302,13 @@ var storageAPIPutShard = func(ctx context.Context, host string, args *blobnode.P
 	defer memPool.Put(buffer)
 
 	buffer = buffer[:int(args.Size)]
-	_, err = io.ReadFull(args.Body, buffer)
-	if err != nil {
-		return
+	if args.NopData {
+		bytespool.Zero(buffer)
+	} else {
+		_, err = io.ReadFull(args.Body, buffer)
+		if err != nil {
+			return
+		}
 	}
 
 	crc = crc32.ChecksumIEEE(buffer)

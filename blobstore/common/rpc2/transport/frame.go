@@ -83,6 +83,8 @@ func (h updHeader) Window() uint32 {
 
 // FrameWrite frame for write
 type FrameWrite struct {
+	recycle bool
+
 	ver byte
 	cmd byte
 	sid uint32
@@ -93,6 +95,7 @@ type FrameWrite struct {
 
 	done uint32 // 0 = new, 1 = locked, 2 == closed
 	ctx  context.Context
+	f    *FrameWrite // origin frame to close
 }
 
 func (f *FrameWrite) tryLock() bool {
@@ -145,6 +148,21 @@ func (f *FrameWrite) Len() int {
 }
 
 func (f *FrameWrite) Close() (err error) {
+	if f.f != nil {
+		if f.recycle {
+			f.f.recycle = true
+		}
+		err = f.f.Close()
+		if f.recycle {
+			if ab, is := f.ab.(*unAlignedBuffer); is {
+				*ab = unAlignedBuffer{}
+				poolunAlignedBuffer.Put(ab) // nolint: staticcheck
+			}
+			*f = FrameWrite{}
+			poolFrameWrite.Put(f) // nolint: staticcheck
+		}
+		return
+	}
 	for !atomic.CompareAndSwapUint32(&f.done, 0, 2) {
 		if atomic.LoadUint32(&f.done) == 2 {
 			return nil
@@ -155,6 +173,10 @@ func (f *FrameWrite) Close() (err error) {
 	if f.ab != nil {
 		err = f.ab.Free()
 		f.ab = nil
+		if f.recycle {
+			*f = FrameWrite{}
+			poolFrameWrite.Put(f) // nolint: staticcheck
+		}
 	}
 	return
 }
@@ -168,6 +190,48 @@ func (f *FrameWrite) Context() context.Context {
 
 func (f *FrameWrite) WithContext(ctx context.Context) {
 	f.ctx = ctx
+}
+
+type unAlignedBuffer struct {
+	offset int
+	buffer []byte
+	ab     AssignedBuffer
+}
+
+func (ub *unAlignedBuffer) Bytes() []byte { return ub.buffer }
+func (ub *unAlignedBuffer) Written(n int) { ub.offset += n }
+func (ub *unAlignedBuffer) Len() int      { return ub.offset }
+func (ub *unAlignedBuffer) Free() error   { return ub.ab.Free() }
+
+func (f *FrameWrite) TrimHead(head int) *FrameWrite {
+	off := f.off - head
+	data := f.data[head:]
+	ab := poolunAlignedBuffer.Get().(*unAlignedBuffer)
+	*ab = unAlignedBuffer{
+		offset: off,
+		buffer: data,
+		ab:     f.ab,
+	}
+	fw := poolFrameWrite.Get().(*FrameWrite)
+	*fw = FrameWrite{
+		ver: f.ver,
+		cmd: f.cmd,
+		sid: f.sid,
+
+		ab:   ab,
+		off:  off,
+		data: data,
+
+		ctx: f.ctx,
+		f:   f,
+	}
+	return fw
+}
+
+func (f *FrameWrite) TrimTail(tail int) *FrameWrite {
+	f.ab.Written(-tail)
+	f.off -= tail
+	return f
 }
 
 // FrameRead frame for read
@@ -220,6 +284,7 @@ func (f *FrameRead) Close() (err error) {
 	if f.ab != nil {
 		err = f.ab.Free()
 		f.ab = nil
+		poolFrameRead.Put(f) // nolint: staticcheck
 	}
 	return
 }

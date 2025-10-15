@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 
 	"github.com/afex/hystrix-go/hystrix"
 	"golang.org/x/sync/singleflight"
@@ -27,6 +28,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/access/controller"
 	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/blobstore/api/blobnode"
+	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/api/proxy"
 	"github.com/cubefs/cubefs/blobstore/api/shardnode"
 	"github.com/cubefs/cubefs/blobstore/common/codemode"
@@ -47,6 +49,7 @@ const (
 	rwCommand    = "rw"
 
 	serviceProxy = proto.ServiceNameProxy
+	serviceShard = proto.ServiceNameShardNode
 )
 
 // StreamHandler stream http handler
@@ -151,6 +154,10 @@ type StreamConfig struct {
 	LogSlowBaseSpeedKB int     `json:"log_slow_base_speed_kb"`
 	LogSlowTimeFator   float32 `json:"log_slow_time_fator"`
 
+	// DeleteIntoShardnodePercentage roundrobin percentage [1-100]
+	DeleteIntoShardnodePercentage int64 `json:"delete_into_shardnode_percentage"`
+	deleteRoundrobin              int64 `json:"-"`
+
 	MemPoolSizeClasses map[int]int `json:"mem_pool_size_classes"`
 
 	// CodeModesPutQuorums
@@ -249,6 +256,10 @@ func confCheck(cfg *StreamConfig) error {
 	defaulter.LessOrEqual(&cfg.LogSlowBaseTimeMS, 500)
 	defaulter.Equal(&cfg.LogSlowBaseSpeedKB, 1<<10)
 	defaulter.LessOrEqual(&cfg.LogSlowTimeFator, float32(2.0))
+	defaulter.IntegerLess(&cfg.DeleteIntoShardnodePercentage, 0)
+	if cfg.DeleteIntoShardnodePercentage > 100 {
+		cfg.DeleteIntoShardnodePercentage = 100
+	}
 
 	defaulter.LessOrEqual(&cfg.ClusterConfig.CMClientConfig.Config.ClientTimeoutMs, defaultTimeoutClusterMgr)
 	defaulter.LessOrEqual(&cfg.BlobnodeConfig.ClientTimeoutMs, defaultTimeoutBlobnode)
@@ -300,8 +311,14 @@ func NewStreamHandler(cfg *StreamConfig, stopCh <-chan struct{}) (h StreamHandle
 		// Do not use rpc retry, because the stream blob handles retries itself
 		defaulter.LessOrEqual(&cfg.ShardnodeConfig.Config.Retry, int(1))
 		handler.shardnodeClient = shardnode.New(cfg.ShardnodeConfig.Config)
+	} else { // disable write delete msg to shardnode
+		handler.StreamConfig.DeleteIntoShardnodePercentage = 0
 	}
 
+	if err = clustermgr.LoadExtendCodemode(context.Background(), handler.clusterController); err != nil {
+		e = errors.Newf("load extend codemode failed, err: %+v", err)
+		return
+	}
 	rawCodeModePolicies, err := handler.clusterController.GetConfig(context.Background(), proto.CodeModeConfigKey)
 	if err != nil {
 		e = errors.Newf("get codemode policy from cluster manager failed, err: %+v", err)
@@ -360,7 +377,14 @@ func NewStreamHandler(cfg *StreamConfig, stopCh <-chan struct{}) (h StreamHandle
 // Delete delete all blobs in this location
 func (h *Handler) Delete(ctx context.Context, location *proto.Location) error {
 	span := trace.SpanFromContextSafe(ctx)
-	span.Debugf("to delete %+v", location)
+	if h.DeleteIntoShardnodePercentage > 0 {
+		percentage := (atomic.AddInt64(&h.deleteRoundrobin, 1) % 100) + 1
+		if percentage <= h.DeleteIntoShardnodePercentage {
+			span.Debugf("to delete into shardnode %+v", location)
+			return h.clearGarbageIntoShardnode(ctx, location)
+		}
+	}
+	span.Debugf("to delete into proxy %+v", location)
 	return h.clearGarbage(ctx, location)
 }
 
@@ -374,7 +398,6 @@ func (h *Handler) Admin() interface{} {
 }
 
 func (h *Handler) sendRepairMsgBg(ctx context.Context, blob blobIdent, badIdxes []uint8) {
-	ctx = trace.NewContextFromContext(ctx)
 	go func() {
 		h.sendRepairMsg(ctx, blob, badIdxes)
 	}()
@@ -529,16 +552,11 @@ func (h *Handler) punishShardnodeDisk(ctx context.Context, clusterID proto.Clust
 	}
 }
 
-// blobCount blobSize > 0 is certain
-func blobCount(size uint64, blobSize uint32) uint64 {
-	return (size + uint64(blobSize) - 1) / uint64(blobSize)
-}
-
-func minU64(a, b uint64) uint64 {
-	if a <= b {
-		return a
+func (h *Handler) punishShardnodeDiskWith(ctx context.Context, clusterID proto.ClusterID, diskID proto.DiskID, host, reason string) {
+	reportUnhealth(clusterID, "punish", "shardnode", host, reason)
+	if serviceController, err := h.clusterController.GetServiceController(clusterID); err == nil {
+		serviceController.PunishShardnodeDiskWithThreshold(ctx, diskID, h.ShardnodePunishIntervalS)
 	}
-	return b
 }
 
 func errorTimeout(err error) bool {

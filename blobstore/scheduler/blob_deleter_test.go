@@ -52,6 +52,7 @@ func newBlobDeleteMgr(t *testing.T) *BlobDeleteMgr {
 		},
 	)
 	clusterTopology.EXPECT().IsBrokenDisk(any).AnyTimes().Return(false)
+	clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 	switchMgr := taskswitch.NewSwitchMgr(clusterMgrCli)
 	taskSwitch, err := switchMgr.AddSwitch(proto.TaskTypeBlobDelete.String())
 	require.NoError(t, err)
@@ -123,6 +124,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// consume success
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -147,6 +149,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// consume failed
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{Vid: vid, VunitLocations: []proto.VunitLocation{{Vuid: 1}}}, nil
@@ -172,9 +175,39 @@ func TestBlobDeleteConsume(t *testing.T) {
 		mgr.blobnodeCli = oldBlobNode
 	}
 	{
+		// retry many times and sleep and success
+		oldClusterTopology := mgr.clusterTopology
+		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
+		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
+			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
+				return &client.VolumeInfoSimple{
+					Vid:            vid,
+					VunitLocations: []proto.VunitLocation{{Vuid: 1}},
+				}, nil
+			},
+		)
+		clusterTopology.EXPECT().IsBrokenDisk(any).Return(false)
+		mgr.clusterTopology = clusterTopology
+		msg := &proto.DeleteMsg{
+			Bid: 1, Vid: 1, ReqId: "123456", Retry: 4,
+			FailTime: time.Now().Unix() - int64(mgr.punishTime.Seconds()) + 1,
+		}
+
+		ret := delBlobRet{delMsg: msg, ctx: ctx}
+		mgr.consume(&ret, commonCloser)
+		require.Equal(t, DeleteStatusDone, ret.status)
+		require.Equal(t, 1, len(msg.BlobDelStages.Stages))
+		for _, v := range msg.BlobDelStages.Stages {
+			require.Equal(t, proto.DeleteStageDelete, v)
+		}
+		mgr.clusterTopology = oldClusterTopology
+	}
+	{
 		// consume cancel
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -211,6 +244,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// consume success
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -236,7 +270,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// has mark deleted and not send request to blobnode
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
-
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				vuid, _ := proto.NewVuid(vid, 0, 1)
@@ -265,7 +299,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// has deleted and not send request to blobnode
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
-
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				vuid, _ := proto.NewVuid(vid, 0, 1)
@@ -294,6 +328,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// delete protected
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -321,6 +356,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// delete protected and cancel
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -353,6 +389,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// blobnode delete failed
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{Vid: vid, VunitLocations: []proto.VunitLocation{{Vuid: 1}}}, nil
@@ -370,7 +407,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		ret := delBlobRet{delMsg: msg, ctx: ctx}
 		mgr.consume(&ret, commonCloser)
 		require.Equal(t, DeleteStatusFailed, ret.status)
-		require.ErrorIs(t, errMock, ret.err)
+		require.ErrorIs(t, ret.err, errMock)
 		mgr.clusterTopology = oldClusterTopology
 		mgr.blobnodeCli = oldBlobNode
 	}
@@ -378,6 +415,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// blobnode return ErrDiskBroken
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{Vid: vid, VunitLocations: []proto.VunitLocation{{Vuid: 1}}}, nil
@@ -404,7 +442,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		mgr.consume(&ret, commonCloser)
 		require.Equal(t, DeleteStatusFailed, ret.status)
 		require.Nil(t, msg.BlobDelStages.Stages)
-		require.ErrorIs(t, errcode.ErrDiskBroken, ret.err)
+		require.ErrorIs(t, ret.err, errcode.ErrDiskBroken)
 		mgr.clusterTopology = oldClusterTopology
 		mgr.blobnodeCli = oldBlobNode
 	}
@@ -412,6 +450,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// blobnode return ErrDiskBroken, and clusterTopology update not eql
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -456,7 +495,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		mgr.consume(&ret, commonCloser)
 		require.Equal(t, DeleteStatusFailed, ret.status)
 		require.Nil(t, msg.BlobDelStages.Stages)
-		require.ErrorIs(t, errcode.ErrDiskBroken, ret.err)
+		require.ErrorIs(t, ret.err, errcode.ErrDiskBroken)
 
 		mgr.clusterTopology = oldClusterTopology
 		mgr.blobnodeCli = oldBlobNode
@@ -465,6 +504,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// has broken disk and not send requests to blobnode
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -488,6 +528,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		// message punished and consume success
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -528,6 +569,7 @@ func TestBlobDeleteConsume(t *testing.T) {
 		start := time.Now()
 		oldClusterTopology := mgr.clusterTopology
 		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, true)
 		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
 			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
 				return &client.VolumeInfoSimple{
@@ -560,6 +602,36 @@ func TestBlobDeleteConsume(t *testing.T) {
 		mgr.clusterTopology = oldClusterTopology
 		mgr.blobnodeCli = oldBlobNode
 		mgr.slowDownTime = oldSlowDownTime
+	}
+	{
+		// volume has repaired disk should update volume
+		oldClusterTopology := mgr.clusterTopology
+		clusterTopology := NewMockClusterTopology(ctr)
+		clusterTopology.EXPECT().GetDisk(any).AnyTimes().Return(nil, false)
+		clusterTopology.EXPECT().GetVolume(any).AnyTimes().DoAndReturn(
+			func(vid proto.Vid) (*client.VolumeInfoSimple, error) {
+				return &client.VolumeInfoSimple{
+					Vid:            vid,
+					VunitLocations: []proto.VunitLocation{{Vuid: 1, DiskID: testDisk1.DiskID}},
+				}, nil
+			},
+		)
+		clusterTopology.EXPECT().IsBrokenDisk(any).AnyTimes().Return(false)
+		clusterTopology.EXPECT().UpdateVolume(any).AnyTimes().Return(nil, errMock)
+
+		oldBlobNode := mgr.blobnodeCli
+		blobnodeCli := NewMockBlobnodeAPI(ctr)
+		blobnodeCli.EXPECT().MarkDelete(any, any, any).AnyTimes().Return(bloberr.ErrRequestTimeout)
+		mgr.blobnodeCli = blobnodeCli
+		mgr.clusterTopology = clusterTopology
+
+		msg := &proto.DeleteMsg{Bid: 10, Vid: 3, ReqId: "delete failed"}
+		ret := delBlobRet{delMsg: msg, ctx: ctx}
+		mgr.consume(&ret, commonCloser)
+		require.Equal(t, DeleteStatusFailed, ret.status)
+		require.Nil(t, msg.BlobDelStages.Stages)
+		mgr.clusterTopology = oldClusterTopology
+		mgr.blobnodeCli = oldBlobNode
 	}
 }
 

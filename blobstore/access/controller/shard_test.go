@@ -14,6 +14,7 @@ import (
 	acapi "github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/api/shardnode"
+	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/sharding"
 	"github.com/cubefs/cubefs/blobstore/testing/mocks"
@@ -50,14 +51,16 @@ func TestShardController(t *testing.T) {
 
 	require.NoError(t, err)
 	s, err := NewShardController(shardCtrlConf{}, cmCli, svrCtrl, stopCh)
-	require.Nil(t, err)
-	require.NotEqual(t, errMock, err)
-
-	blobName := []byte("blob1")
-	shardKeys := [][]byte{blobName}
-	// empty tree
-	_, err = s.GetShard(ctx, shardKeys)
 	require.NotNil(t, err)
+	require.NotEqual(t, errMock, err)
+	require.ErrorIs(t, err, errcode.ErrAccessNotFoundShard)
+	require.Nil(t, s)
+
+	blobName := "blob1"
+	shardKeys := []string{blobName}
+	// empty tree
+	// _, err = s.GetShard(ctx, shardKeys)
+	// require.NotNil(t, err)
 
 	sh := &shard{
 		shardID: 1,
@@ -71,8 +74,9 @@ func TestShardController(t *testing.T) {
 	}
 	sh.rangeExt = *rangePtr
 	svr := &shardControllerImpl{
-		shards: make(map[proto.ShardID]*shard),
-		ranges: btree.New(defaultBTreeDegree),
+		shards:      make(map[proto.ShardID]*shard),
+		ranges:      btree.New(defaultBTreeDegree),
+		subRangeCnt: 1,
 	}
 
 	// add one, not found blob
@@ -83,6 +87,7 @@ func TestShardController(t *testing.T) {
 	svr.delShardNoLock(sh)
 	require.Equal(t, 0, len(svr.shards))
 
+	svr.subRangeCnt = 2
 	ranges := sharding.InitShardingRange(sharding.RangeType_RangeTypeHash, 1, 8)
 	{
 		// add 8 shard
@@ -120,8 +125,9 @@ func TestShardController(t *testing.T) {
 		svr.punishCtrl = svrCtrl
 		svr.version = 8
 
-		ret, err := svr.GetShard(ctx, [][]byte{[]byte("blob1__xxx")}) // expect 2 keys
-		sk := [][]byte{[]byte("blob1__xxx")}
+		// ret, err := svr.GetShard(ctx, []byte("blob1__xxx")) // expect 2 keys
+		ret, err := svr.GetShard(ctx, []string{"blob1__xxx"}) // expect 2 keys
+		sk := []string{"blob1__xxx"}
 		bd := sharding.NewCompareItem(sharding.RangeType_RangeTypeHash, sk).GetBoundary()
 		t.Logf("shard key 1, key boundary=%d, shardBounary=%d, range=%s, treeLen=%d", bd, ret.(*shard).rangeExt.MaxBoundary(), ret.(*shard).String(), svr.ranges.Len())
 		// for i := range shards {
@@ -131,8 +137,9 @@ func TestShardController(t *testing.T) {
 		require.Nil(t, err)
 		require.Equal(t, proto.ShardID(2), ret.(*shard).shardID)
 
-		ret, err = svr.GetShard(ctx, [][]byte{[]byte("blob2__yy"), []byte("11")})
-		bd = sharding.NewCompareItem(sharding.RangeType_RangeTypeHash, [][]byte{[]byte("blob2__yy"), []byte("11")}).GetBoundary()
+		// ret, err = svr.GetShard(ctx, []byte("{blob2__yy}{11}"))
+		ret, err = svr.GetShard(ctx, []string{"blob2__yy", "11"})
+		bd = sharding.NewCompareItem(sharding.RangeType_RangeTypeHash, []string{"blob2__yy", "11"}).GetBoundary()
 		t.Logf("shard key 2,  get boundary=%d", bd)
 		require.Nil(t, err)
 		require.Equal(t, proto.ShardID(7), ret.(*shard).shardID)
@@ -174,7 +181,7 @@ func TestShardController(t *testing.T) {
 		require.Equal(t, clustermgr.ShardUnit{Suid: proto.EncodeSuid(1, 1, 0), DiskID: 2}, si.units[1])
 		// require.Equal(t, clustermgr.ShardUnit{Suid: proto.EncodeSuid(1, 2, 1), DiskID: 4}, si.units[2])
 
-		opInfo, err := si.GetMember(ctx, acapi.GetShardModeLeader, 0)
+		opInfo, err := si.GetMember(ctx, acapi.GetShardModeLeader, nil)
 		require.NoError(t, err)
 		require.Equal(t, ShardOpInfo{
 			DiskID:       2,
@@ -629,7 +636,7 @@ func TestShardUpdate(t *testing.T) {
 		sd, exist := svr.getShardNoLock(shardID)
 		require.True(t, exist)
 
-		opHeader, err := sd.GetMember(ctx, acapi.GetShardModeLeader, 0)
+		opHeader, err := sd.GetMember(ctx, acapi.GetShardModeLeader, nil)
 		require.NoError(t, err)
 		expect := ShardOpInfo{
 			DiskID:       1,
@@ -671,7 +678,7 @@ func TestShardUpdate(t *testing.T) {
 			},
 		}
 		err = svr.handleShardUpdate(ctx, item)
-		require.ErrorIs(t, errCatalogNoLeader, err)
+		require.ErrorIs(t, err, errCatalogNoLeader)
 
 		sd, exist := svr.getShardNoLock(shardID)
 		require.True(t, exist)
@@ -708,8 +715,9 @@ func TestShardUpdate(t *testing.T) {
 func TestShardGetShard(t *testing.T) {
 	ctx := context.Background()
 	svr := &shardControllerImpl{
-		shards: make(map[proto.ShardID]*shard),
-		ranges: btree.New(defaultBTreeDegree),
+		shards:      make(map[proto.ShardID]*shard),
+		ranges:      btree.New(defaultBTreeDegree),
+		subRangeCnt: 2,
 	}
 
 	ctr := gomock.NewController(t)
@@ -777,11 +785,13 @@ func TestShardGetShard(t *testing.T) {
 	require.Equal(t, 8, len(svr.shards))
 
 	{
-		sd, err := svr.GetShard(ctx, [][]byte{[]byte("blob1"), []byte("1")})
+		// sd, err := svr.GetShard(ctx, []byte("{blob1}{1}"))
+		sd, err := svr.GetShard(ctx, []string{"blob1", "1"})
 		require.NoError(t, err)
 		require.Equal(t, proto.ShardID(2), sd.GetShardID())
 
-		sd, err = svr.GetShard(ctx, [][]byte{[]byte("blob1"), {}})
+		// sd, err = svr.GetShard(ctx, []byte("{blob1}{}"))
+		sd, err = svr.GetShard(ctx, []string{"blob1", ""})
 		require.NoError(t, err)
 		require.Equal(t, proto.ShardID(2), sd.GetShardID())
 
@@ -789,11 +799,11 @@ func TestShardGetShard(t *testing.T) {
 		sd, err = svr.GetShardByID(ctx, proto.ShardID(1))
 		require.NoError(t, err)
 
-		shardInfo, err := sd.GetMember(ctx, acapi.GetShardModeLeader, 0)
+		shardInfo, err := sd.GetMember(ctx, acapi.GetShardModeLeader, nil)
 		require.NoError(t, err)
 		require.Equal(t, shards[0].shardID, shardInfo.Suid.ShardID())
 
-		shardInfo, err = sd.GetMember(ctx, acapi.GetShardModeRandom, 0)
+		shardInfo, err = sd.GetMember(ctx, acapi.GetShardModeRandom, nil)
 		require.NoError(t, err)
 		require.Equal(t, shards[0].shardID, shardInfo.Suid.ShardID())
 
@@ -807,10 +817,11 @@ func TestShardGetShard(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, proto.ShardID(1), sd.GetShardID())
 
-		newDisk, err := sd.GetMember(ctx, acapi.GetShardModeRandom, 2)
+		newDisk, err := sd.GetMember(ctx, acapi.GetShardModeRandom, map[proto.DiskID]struct{}{2: {}, 1: {}})
 		require.NoError(t, err)
 		require.NotEqual(t, proto.DiskID(2), newDisk.DiskID)
-		require.Contains(t, []proto.DiskID{1, 3}, newDisk.DiskID)
+		require.NotEqual(t, proto.DiskID(1), newDisk.DiskID)
+		require.Contains(t, []proto.DiskID{3}, newDisk.DiskID)
 	}
 
 	// get shard by range

@@ -145,7 +145,6 @@ func TestEncodeDecodeBodyBase(t *testing.T) {
 					size = blockSize - 1
 				}
 
-				logName := fmt.Sprintf("step: %d block:%d size:%d", step, blockSize, size)
 				block := newBlock(uint32(blockSize))
 				if size%2 == 1 {
 					block = ChecksumBlock{
@@ -154,8 +153,12 @@ func TestEncodeDecodeBodyBase(t *testing.T) {
 						BlockSize: uint32(blockSize),
 					}
 				}
+				if size%3 == 1 {
+					block.Aligned = true
+				}
+				logName := fmt.Sprintf("block:%+v", block)
 				clientBody := &randReadWriter{rhasher: crc32.NewIEEE()}
-				encodeBody := newEdBody(block, clientNopBody(io.NopCloser(clientBody)), size, true)
+				encodeBody := NewEncodeDecodeBody(block, clientNopBody(io.NopCloser(clientBody)), size, true)
 
 				transBody := &transReadWriter{step: step, data: make([]byte, block.EncodeSize(int64(size)))}
 				nn, err := transBody.ReadFrom(encodeBody)
@@ -166,7 +169,7 @@ func TestEncodeDecodeBodyBase(t *testing.T) {
 				encodeBody.Close()
 
 				transBody.off = 0
-				decodeBody := newEdBody(block, transBody, size, false)
+				decodeBody := NewEncodeDecodeBody(block, transBody, size, false)
 				serverBody := &randReadWriter{whasher: crc32.NewIEEE()}
 
 				if idx%2 == 0 {
@@ -175,7 +178,7 @@ func TestEncodeDecodeBodyBase(t *testing.T) {
 					require.Equal(t, block.EncodeSize(int64(size)), nn, logName)
 					require.Equal(t, clientBody.rhasher.Sum32(), serverBody.whasher.Sum32(), logName)
 					_, err = decodeBody.WriteTo(serverBody)
-					require.ErrorIs(t, io.EOF, err, logName)
+					require.ErrorIs(t, err, io.EOF, logName)
 				} else {
 					b := make([]byte, size)
 					n, err := io.ReadFull(decodeBody, b)
@@ -184,8 +187,9 @@ func TestEncodeDecodeBodyBase(t *testing.T) {
 					serverBody.Write(b)
 					require.Equal(t, clientBody.rhasher.Sum32(), serverBody.whasher.Sum32(), logName)
 					_, err = decodeBody.Read(make([]byte, 1))
-					require.ErrorIs(t, io.EOF, err, logName)
+					require.ErrorIs(t, err, io.EOF, logName)
 				}
+				decodeBody.Close()
 			}
 		}
 	}
@@ -224,7 +228,7 @@ func TestEncodeDecodeBodyMissmatch(t *testing.T) {
 		require.NoError(t, err)
 
 		transBody.off = 0
-		transBody.data[10] += 1
+		transBody.data[0] += 1
 		decodeBody := newEdBody(block, transBody, size, false)
 		serverBody := &randReadWriter{whasher: crc32.NewIEEE()}
 

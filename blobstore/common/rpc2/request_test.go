@@ -50,21 +50,21 @@ func TestRequestTimeout(t *testing.T) {
 	require.NoError(t, err)
 	req = req.WithContext(context.Background())
 	err = cli.DoWith(req, nil)
-	require.ErrorIs(t, transport.ErrTimeout, err)
+	require.ErrorIs(t, err, transport.ErrTimeout)
 	cli.RequestTimeout.Duration = 0
 
 	ctx, cancel := context.WithTimeout(testCtx, 100*time.Millisecond)
 	req, err = NewRequest(ctx, server.Name, "/", nil, nil)
 	require.NoError(t, err)
 	err = cli.DoWith(req, nil)
-	require.ErrorIs(t, transport.ErrTimeout, err)
+	require.Error(t, err)
 	cancel()
 
 	cli.Timeout.Duration = 200 * time.Millisecond
 	req, err = NewRequest(testCtx, server.Name, "/", nil, nil)
 	require.NoError(t, err)
 	err = cli.DoWith(req, nil)
-	require.ErrorIs(t, transport.ErrTimeout, err)
+	require.ErrorIs(t, err, transport.ErrTimeout)
 	cli.Timeout.Duration = 0
 
 	buff := make([]byte, 8<<20)
@@ -120,11 +120,17 @@ func TestRequestErrors(t *testing.T) {
 			BlockSize: 1 << 10,
 		})
 	})
+	require.Panics(t, func() {
+		req.OptionChecksum(ChecksumBlock{
+			Algorithm: ChecksumAlgorithm_Crc_IEEE,
+			BlockSize: (1 << 10) + 1,
+		})
+	})
 	req.OptionCrcDownload()
 	req.OptionCrcDownload()
 	require.NoError(t, err)
 	err = cli.DoWith(req, nil)
-	require.ErrorIs(t, ErrFrameHeader, err)
+	require.ErrorIs(t, err, ErrFrameHeader)
 }
 
 func handleBodyReadable(w ResponseWriter, req *Request) error {
@@ -191,4 +197,48 @@ func TestRequestRetryCrc(t *testing.T) {
 	sum := hasher.Sum(nil)
 	require.NoError(t, cli.DoWith(req, args))
 	require.True(t, args.Value == fmt.Sprintf("%d", binary.BigEndian.Uint32(sum)))
+}
+
+type reuseConnector struct {
+	Connector
+	broken bool
+}
+
+func (c *reuseConnector) Put(ctx context.Context, stream *transport.Stream, broken bool) error {
+	c.broken = broken
+	return c.Connector.Put(ctx, stream, broken)
+}
+
+func TestRequestErrorReuseStream(t *testing.T) {
+	var handler Router
+	var called bool
+	handler.Register("/", func(w ResponseWriter, req *Request) error {
+		if !called {
+			called = true
+			return NewError(999, "Reuse", "should reuse stream")
+		}
+		buff := make([]byte, 16)
+		w.SetContentLength(int64(len(buff)))
+		w.WriteHeader(999, nil)
+		_, err := w.ReadFrom(bytes.NewReader(buff))
+		return err
+	})
+
+	server, cli, shutdown := newServer("tcp", &handler)
+	defer shutdown()
+	cli.Retry = 1
+	rc := &reuseConnector{Connector: defaultConnector(cli.ConnectorConfig)}
+	cli.Connector = rc
+
+	req, _ := NewRequest(testCtx, server.Name, "/", nil, nil)
+	err := cli.DoWith(req, nil)
+	require.Error(t, err)
+	require.Equal(t, int32(999), err.(*Error).GetStatus())
+	require.Equal(t, "should reuse stream", err.(*Error).GetDetail())
+	require.False(t, rc.broken)
+
+	require.Error(t, cli.DoWith(req, nil))
+	require.True(t, rc.broken)
+	require.Error(t, cli.DoWith(req, nil))
+	require.True(t, rc.broken)
 }

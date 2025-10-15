@@ -15,6 +15,8 @@
 package crc32block
 
 import (
+	crand "crypto/rand"
+	"hash/crc32"
 	"math/rand"
 	"testing"
 
@@ -77,4 +79,68 @@ func TestSetBlockSize(t *testing.T) {
 		require.Equal(t, dt.encodeSize, NewBodyEncoder(nil).CodeSize(dt.fsize))
 		require.Equal(t, dt.fsize, NewBodyDecoder(nil).CodeSize(dt.encodeSize))
 	}
+}
+
+func TestConstZeroCrc(t *testing.T) {
+	require.Equal(t, uint32(0), ConstZeroCrc(-1))
+	require.Equal(t, uint32(0), ConstZeroCrc(0))
+	for range [100]struct{}{} {
+		size := int(rand.Int31n(1 << 20))
+		act := crc32.ChecksumIEEE(make([]byte, size))
+		get1 := ConstZeroCrc(size)
+		get2 := ConstZeroCrc(size)
+		require.Equal(t, act, get1)
+		require.Equal(t, act, get2)
+	}
+}
+
+func TestIsZeroBuffer(t *testing.T) {
+	require.True(t, IsZeroBuffer(nil))
+	for _, size := range []int{1, 3, 1 << 10, 1 << 19} {
+		buffer := make([]byte, size)
+		require.True(t, IsZeroBuffer(buffer))
+		buffer[0] = 'a'
+		require.False(t, IsZeroBuffer(buffer))
+		buffer[0] = 0
+		buffer[len(buffer)-1] = 'z'
+		require.False(t, IsZeroBuffer(buffer))
+		buffer[len(buffer)-1] = 0
+		require.True(t, IsZeroBuffer(buffer))
+		crand.Read(buffer)
+		require.False(t, IsZeroBuffer(buffer))
+	}
+}
+
+func BenchmarkIsZeroBuffer(b *testing.B) {
+	b.Run("1M-zero-all", func(b *testing.B) {
+		buffer := make([]byte, 1<<20)
+		b.ResetTimer()
+		for ii := 0; ii <= b.N; ii++ {
+			IsZeroBuffer(buffer)
+		}
+	})
+	b.Run("1M-not-zero-first", func(b *testing.B) {
+		buffer := make([]byte, 1<<20)
+		buffer[7] = 1
+		b.ResetTimer()
+		for ii := 0; ii <= b.N; ii++ {
+			IsZeroBuffer(buffer)
+		}
+	})
+	b.Run("1M-not-zero-mid", func(b *testing.B) {
+		buffer := make([]byte, 1<<20)
+		buffer[1<<19] = 1
+		b.ResetTimer()
+		for ii := 0; ii <= b.N; ii++ {
+			IsZeroBuffer(buffer)
+		}
+	})
+	b.Run("1M-not-zero-last", func(b *testing.B) {
+		buffer := make([]byte, 1<<20)
+		buffer[(1<<20)-1] = 1
+		b.ResetTimer()
+		for ii := 0; ii <= b.N; ii++ {
+			IsZeroBuffer(buffer)
+		}
+	})
 }

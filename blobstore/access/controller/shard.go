@@ -48,7 +48,7 @@ var (
 )
 
 type IShardController interface {
-	GetShard(ctx context.Context, shardKeys [][]byte) (Shard, error)
+	GetShard(ctx context.Context, shardKeys []string) (Shard, error)
 	GetShardByID(ctx context.Context, shardID proto.ShardID) (Shard, error)
 	GetShardByRange(ctx context.Context, shardRange sharding.Range) (Shard, error)
 	GetFisrtShard(ctx context.Context) (Shard, error)
@@ -56,6 +56,7 @@ type IShardController interface {
 	GetSpaceID() proto.SpaceID
 	UpdateRoute(ctx context.Context) error
 	UpdateShard(ctx context.Context, ss shardnode.ShardStats) error
+	GetShardSubRangeCount(ctx context.Context) int
 }
 
 type shardCtrlConf struct {
@@ -101,6 +102,12 @@ func NewShardController(conf shardCtrlConf, cmCli clustermgr.ClientAPI, punishCt
 		return nil, err
 	}
 
+	sd, err := s.GetFisrtShard(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.subRangeCnt = len(sd.(*shard).rangeExt.Subs)
+
 	go s.incrementalRoute()
 
 	span.Debugf("success to new shard controller, clusterID:%d, space:%s", conf.clusterID, conf.space.Name)
@@ -113,6 +120,7 @@ type shardControllerImpl struct {
 	version      proto.RouteVersion
 	spaceID      proto.SpaceID
 	groupRun     singleflight.Group
+	subRangeCnt  int
 	sync.RWMutex // todo: I will optimize locker in the next version
 
 	conf       shardCtrlConf
@@ -121,7 +129,7 @@ type shardControllerImpl struct {
 	stopCh     <-chan struct{}
 }
 
-func (s *shardControllerImpl) GetShard(ctx context.Context, shardKeys [][]byte) (Shard, error) {
+func (s *shardControllerImpl) GetShard(ctx context.Context, shardKeys []string) (Shard, error) {
 	// shard_1 ranges [1, 100) , shard 2: [100, 200), shard 3: [200, 300) ...
 	// if compare shard keys=20, it belong to shard 1 ; if keys=100, it belong to shard 2 ; keys=220, belong to shard 3
 	// if keys=120, will walk [shard 2, shard end]
@@ -275,6 +283,10 @@ func (s *shardControllerImpl) UpdateShard(ctx context.Context, sd shardnode.Shar
 		}
 	})
 	return err
+}
+
+func (s *shardControllerImpl) GetShardSubRangeCount(ctx context.Context) int {
+	return s.subRangeCnt
 }
 
 func (s *shardControllerImpl) initSpace(ctx context.Context) error {
@@ -538,7 +550,7 @@ type ShardOpInfo struct {
 type Shard interface {
 	GetShardID() proto.ShardID
 	GetRange() sharding.Range
-	GetMember(context.Context, acapi.GetShardMode, proto.DiskID) (ShardOpInfo, error)
+	GetMember(context.Context, acapi.GetShardMode, map[proto.DiskID]struct{}) (ShardOpInfo, error)
 }
 
 // shard implement btree.Item interface, shard route information
@@ -575,12 +587,12 @@ func (i *shard) GetRange() sharding.Range {
 	return i.rangeExt
 }
 
-func (i *shard) GetMember(ctx context.Context, mode acapi.GetShardMode, exclude proto.DiskID) (ShardOpInfo, error) {
+func (i *shard) GetMember(ctx context.Context, mode acapi.GetShardMode, exclude map[proto.DiskID]struct{}) (ShardOpInfo, error) {
 	span := trace.SpanFromContextSafe(ctx)
 	span.Debugf("get shard member, mode:%d, exclude:%d, shard:%+v", mode, exclude, *i)
 
 	// 1. get member exclude disk id
-	if exclude != 0 {
+	if len(exclude) != 0 {
 		return i.getMemberExcluded(ctx, exclude)
 	}
 
@@ -588,11 +600,11 @@ func (i *shard) GetMember(ctx context.Context, mode acapi.GetShardMode, exclude 
 	if mode == acapi.GetShardModeLeader {
 		return i.getMemberLeader(ctx)
 	}
-	return i.getMemberRandom(ctx, 0)
+	return i.getMemberRandom(ctx, nil)
 }
 
-func (i *shard) getMemberExcluded(ctx context.Context, diskID proto.DiskID) (ShardOpInfo, error) {
-	return i.getMemberRandom(ctx, diskID)
+func (i *shard) getMemberExcluded(ctx context.Context, exclude map[proto.DiskID]struct{}) (ShardOpInfo, error) {
+	return i.getMemberRandom(ctx, exclude)
 }
 
 func (i *shard) getMemberLeader(ctx context.Context) (ShardOpInfo, error) {
@@ -603,7 +615,7 @@ func (i *shard) getMemberLeader(ctx context.Context) (ShardOpInfo, error) {
 	}, nil
 }
 
-func (i *shard) getMemberRandom(ctx context.Context, exclude proto.DiskID) (ShardOpInfo, error) {
+func (i *shard) getMemberRandom(ctx context.Context, exclude map[proto.DiskID]struct{}) (ShardOpInfo, error) {
 	span := trace.SpanFromContextSafe(ctx)
 
 	n := len(i.units)
@@ -615,7 +627,7 @@ func (i *shard) getMemberRandom(ctx context.Context, exclude proto.DiskID) (Shar
 		if err != nil {
 			return ShardOpInfo{}, err
 		}
-		if i.units[idx].DiskID != exclude && !disk.Punished && !i.units[idx].Learner {
+		if _, exist := exclude[i.units[idx].DiskID]; !exist && !disk.Punished && !i.units[idx].Learner {
 			return i.getShardOpInfo(idx), nil
 		}
 

@@ -314,6 +314,18 @@ func (mr *MockServiceControllerMockRecorder) PunishShardnode(arg0, arg1, arg2 in
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PunishShardnode", reflect.TypeOf((*MockServiceController)(nil).PunishShardnode), arg0, arg1, arg2)
 }
 
+// PunishShardnodeDiskWithThreshold mocks base method.
+func (m *MockServiceController) PunishShardnodeDiskWithThreshold(arg0 context.Context, arg1 proto.DiskID, arg2 int) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "PunishShardnodeDiskWithThreshold", arg0, arg1, arg2)
+}
+
+// PunishShardnodeDiskWithThreshold indicates an expected call of PunishShardnodeDiskWithThreshold.
+func (mr *MockServiceControllerMockRecorder) PunishShardnodeDiskWithThreshold(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PunishShardnodeDiskWithThreshold", reflect.TypeOf((*MockServiceController)(nil).PunishShardnodeDiskWithThreshold), arg0, arg1, arg2)
+}
+
 // MockVolumeGetter is a mock of VolumeGetter interface.
 type MockVolumeGetter struct {
 	ctrl     *gomock.Controller
@@ -429,7 +441,7 @@ func (mr *MockShardControllerMockRecorder) GetNextShard(arg0, arg1 interface{}) 
 }
 
 // GetShard mocks base method.
-func (m *MockShardController) GetShard(arg0 context.Context, arg1 [][]byte) (controller.Shard, error) {
+func (m *MockShardController) GetShard(arg0 context.Context, arg1 []string) (controller.Shard, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetShard", arg0, arg1)
 	ret0, _ := ret[0].(controller.Shard)
@@ -471,6 +483,20 @@ func (m *MockShardController) GetShardByRange(arg0 context.Context, arg1 shardin
 func (mr *MockShardControllerMockRecorder) GetShardByRange(arg0, arg1 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetShardByRange", reflect.TypeOf((*MockShardController)(nil).GetShardByRange), arg0, arg1)
+}
+
+// GetShardSubRangeCount mocks base method.
+func (m *MockShardController) GetShardSubRangeCount(arg0 context.Context) int {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetShardSubRangeCount", arg0)
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+// GetShardSubRangeCount indicates an expected call of GetShardSubRangeCount.
+func (mr *MockShardControllerMockRecorder) GetShardSubRangeCount(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetShardSubRangeCount", reflect.TypeOf((*MockShardController)(nil).GetShardSubRangeCount), arg0)
 }
 
 // GetSpaceID mocks base method.
@@ -539,7 +565,7 @@ func (m *MockShard) EXPECT() *MockShardMockRecorder {
 }
 
 // GetMember mocks base method.
-func (m *MockShard) GetMember(arg0 context.Context, arg1 access.GetShardMode, arg2 proto.DiskID) (controller.ShardOpInfo, error) {
+func (m *MockShard) GetMember(arg0 context.Context, arg1 access.GetShardMode, arg2 map[proto.DiskID]struct{}) (controller.ShardOpInfo, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetMember", arg0, arg1, arg2)
 	ret0, _ := ret[0].(controller.ShardOpInfo)

@@ -17,18 +17,24 @@ package blobnode
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/golang/mock/gomock"
+	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/require"
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
@@ -39,15 +45,23 @@ import (
 	"github.com/cubefs/cubefs/blobstore/blobnode/core/disk"
 	"github.com/cubefs/cubefs/blobstore/blobnode/db"
 	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
+	"github.com/cubefs/cubefs/blobstore/common/iostat"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
+	"github.com/cubefs/cubefs/blobstore/common/taskswitch"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	"github.com/cubefs/cubefs/blobstore/testing/mocks"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
 const (
 	defaultSvrTestDir = "BlobNodeSvrTestDir_"
+)
+
+var (
+	any     = gomock.Any()
+	errMock = errors.New("fake error")
 )
 
 var cleanWG sync.WaitGroup
@@ -237,8 +251,8 @@ func TestHandleDiskDrop(t *testing.T) {
 	require.Equal(t, di.Status, proto.DiskStatusNormal)
 }
 
-func TestService2(t *testing.T) {
-	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"Service2")
+func TestServiceError(t *testing.T) {
+	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"ServiceError")
 	require.NoError(t, err)
 	defer os.Remove(workDir)
 
@@ -328,20 +342,32 @@ func newTestBlobNodeService(t *testing.T, path string) (*Service, *mockClusterMg
 		ioFlowStat, _ := flow.NewIOFlowStat("default", false)
 		ioview := flow.NewDiskViewer(ioFlowStat)
 		conf.DiskConfig.DataQos = qos.Config{
-			ReadMBPS:   20,
-			WriteMBPS:  20,
 			DiskViewer: ioview,
 			StatGetter: ioFlowStat,
+			FlowConfig: qos.FlowConfig{
+				Level: qos.LevelConfigMap{
+					bnapi.ReadIO.String():       {MBPS: 20},
+					bnapi.WriteIO.String():      {MBPS: 20},
+					bnapi.DeleteIO.String():     {MBPS: 10},
+					bnapi.BackgroundIO.String(): {MBPS: 10},
+				},
+			},
 		}
 	}
 	if path == "bpslimit" {
 		ioFlowStat, _ := flow.NewIOFlowStat("default", false)
 		ioview := flow.NewDiskViewer(ioFlowStat)
 		conf.DiskConfig.DataQos = qos.Config{
-			ReadMBPS:   10,
-			WriteMBPS:  10,
 			DiskViewer: ioview,
 			StatGetter: ioFlowStat,
+			FlowConfig: qos.FlowConfig{
+				Level: qos.LevelConfigMap{
+					bnapi.ReadIO.String():       {MBPS: 10},
+					bnapi.WriteIO.String():      {MBPS: 10},
+					bnapi.DeleteIO.String():     {MBPS: 5},
+					bnapi.BackgroundIO.String(): {MBPS: 5},
+				},
+			},
 		}
 	}
 	service, err := NewService(conf)
@@ -369,8 +395,8 @@ func TestService_CmdpChunk(t *testing.T) {
 	mcm := mockClusterMgr{
 		reqIdx: _mockDiskIdBase,
 		disks: []mockDiskInfo{
-			{diskId: proto.DiskID(_mockDiskIdBase + 1), path: path1, status: proto.DiskStatusNormal},
-			{diskId: proto.DiskID(_mockDiskIdBase + 2), path: path2, status: proto.DiskStatusNormal},
+			{diskId: proto.DiskID(_mockDiskIdBase + 1), path: path1, status: proto.DiskStatusRepaired},
+			{diskId: proto.DiskID(_mockDiskIdBase + 2), path: path2, status: proto.DiskStatusRepaired},
 		},
 	}
 
@@ -626,6 +652,14 @@ func init() {
 	rpc.RegisterArgsParser(&cmapi.NodeInfoArgs{}, "json")
 }
 
+func implementExtendCodemode(w http.ResponseWriter, req *http.Request) bool {
+	if strings.HasPrefix(req.URL.Path, "/config/get") {
+		w.Write([]byte(`"[]"`))
+		return true
+	}
+	return false
+}
+
 func mockClusterMgrRouter(service *mockClusterMgr) *rpc.Router {
 	r := rpc.New()
 	r.Handle(http.MethodGet, "/disk/list", service.DiskList, rpc.OptArgsQuery())
@@ -867,6 +901,8 @@ func (mcm *mockClusterMgr) ConfigGet(c *rpc.Context) {
 	switch args.Key {
 	case proto.ChunkOversoldRatioKey:
 		c.RespondJSON("0.5")
+	case proto.CodeModeExtendKey:
+		c.RespondJSON("[]")
 	default:
 		c.RespondError(ErrNotSupportKey)
 	}
@@ -878,8 +914,19 @@ func TestService_ConfigReload(t *testing.T) {
 	ds2 := NewMockDiskAPI(ctr)
 	svr := &Service{
 		Disks: map[proto.DiskID]core.DiskAPI{101: ds1, 202: ds2},
-		Conf:  &Config{DiskConfig: core.RuntimeConfig{DataQos: qos.Config{}}},
+		Conf: &Config{
+			DiskConfig: core.RuntimeConfig{DataQos: qos.Config{
+				FlowConfig: qos.FlowConfig{
+					Level: qos.LevelConfigMap{
+						"read": {MBPS: 300},
+					},
+				},
+			}},
+		},
 	}
+	err := qos.FixQosConfigHotReset(&svr.Conf.DiskConfig.DataQos)
+	require.NoError(t, err)
+
 	testServer := httptest.NewServer(NewHandler(svr))
 
 	{
@@ -891,214 +938,79 @@ func TestService_ConfigReload(t *testing.T) {
 		require.Equal(t, 400, resp.StatusCode)
 	}
 
+	ioStat, _ := iostat.StatInit("", 0, true)
+	iom := &flow.IOFlowStat{}
+	for i := range bnapi.GetAllIOType() {
+		iom[i] = ioStat
+	}
+
 	// for disk 1
-	q1, err := qos.NewIoQueueQos(qos.Config{
-		ReadMBPS:         5,
-		WriteMBPS:        4,
-		BackgroundMBPS:   1,
-		ReadQueueDepth:   2,
-		WriteQueueDepth:  2,
-		WriteChanQueCnt:  1,
-		DeleteQueueDepth: 1,
-	})
+	conf1 := qos.Config{
+		StatGetter: iom,
+		FlowConfig: qos.FlowConfig{
+			Level: qos.LevelConfigMap{
+				bnapi.ReadIO.String():       {MBPS: 5},
+				bnapi.WriteIO.String():      {MBPS: 4},
+				bnapi.DeleteIO.String():     {MBPS: 1},
+				bnapi.BackgroundIO.String(): {MBPS: 1},
+			},
+		},
+	}
+	q1, err := qos.NewQosMgr(conf1)
 	require.NoError(t, err)
 
-	con2 := qos.Config{
-		WriteMBPS:        4,
-		ReadMBPS:         4,
-		BackgroundMBPS:   3,
-		ReadQueueDepth:   1,
-		WriteQueueDepth:  2,
-		WriteChanQueCnt:  1,
-		DeleteQueueDepth: 1,
+	conf2 := qos.Config{
+		StatGetter: iom,
+		FlowConfig: qos.FlowConfig{
+			Level: qos.LevelConfigMap{
+				bnapi.ReadIO.String():       {MBPS: 4},
+				bnapi.WriteIO.String():      {MBPS: 4},
+				bnapi.DeleteIO.String():     {MBPS: 1},
+				bnapi.BackgroundIO.String(): {MBPS: 3},
+			},
+		},
 	}
-	qos.InitAndFixQosConfig(&con2)
-	q2, err := qos.NewIoQueueQos(con2) // for disk 2
+	q2, err := qos.NewQosMgr(conf2) // for disk 2
 	require.NoError(t, err)
 
-	require.Equal(t, 4*1024*1024*2, q1.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeWrite].Burst())
-	require.Equal(t, 1*1024*1024*2, q1.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeBack].Burst())
-	require.Equal(t, 5*1024*1024*2, q1.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeRead].Burst())
-	require.Equal(t, 4*1024*1024, int(q2.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeRead].Limit()))
-	require.Equal(t, 4*1024*1024, int(q2.(*qos.IoQueueQos).GetBpsLimiter()[bnapi.NormalIO].Limit()))
-	require.Equal(t, 3*1024*1024, int(q2.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeBack].Limit()))
-
 	{
-		// only set background, use svr config.normal=0
+		// only set disk bandwidth
 		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
 		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=background_mbps&value=10"
+		// totalUrl := testServer.URL + "/config/reload?key=background_mbps&value=10"
+		totalUrl := testServer.URL + "/config/reload?key=disk.disk_bandwidth_mb&value=17"
 		resp, err := HTTPRequest(http.MethodPost, totalUrl)
 		require.Nil(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, 200, resp.StatusCode)
 
-		lmt := q1.(*qos.IoQueueQos).GetBpsLimiter()
-		require.NotEqual(t, 0, lmt[0].Burst())
-		require.Equal(t, 4*1024*1024*2, lmt[qos.LimitTypeWrite].Burst())
-		require.Equal(t, 4*1024*1024*2, lmt[qos.LimitTypeBack].Burst())
-		require.Equal(t, 4*1024*1024, int(q2.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeRead].Limit()))
-		require.Equal(t, 4*1024*1024, int(q2.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeWrite].Limit()))
-		require.Equal(t, 4*1024*1024, int(q2.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeBack].Limit()))
-	}
-
-	{
-		// set background_mbps, use svr config.normal=2
-		svr.Conf.DiskConfig.DataQos.WriteMBPS = 2
-		svr.Conf.DiskConfig.DataQos.BackgroundMBPS = 1
+		// only set read bandwidth mbps
 		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
 		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=background_mbps&value=10"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
+		// totalUrl := testServer.URL + "/config/reload?key=background_mbps&value=10"
+		totalUrl = testServer.URL + "/config/reload?key=level.read.mbps&value=13"
+		resp, err = HTTPRequest(http.MethodPost, totalUrl)
 		require.Nil(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, 200, resp.StatusCode)
 
-		lmt1 := q1.(*qos.IoQueueQos).GetBpsLimiter()
-		lmt2 := q2.(*qos.IoQueueQos).GetBpsLimiter()
-		require.Equal(t, int(svr.Conf.DiskConfig.DataQos.WriteMBPS*1024*1024), lmt1[qos.LimitTypeWrite].Burst()/2)
-		require.Equal(t, int(2*1024*1024), lmt1[qos.LimitTypeBack].Burst()/2)
-		require.Equal(t, int(svr.Conf.DiskConfig.DataQos.WriteMBPS*1024*1024), lmt2[qos.LimitTypeWrite].Burst()/2)
-		require.Equal(t, int(2*1024*1024), lmt2[qos.LimitTypeBack].Burst()/2)
-	}
-
-	{
-		// write_mbps
-		svr.Conf.DiskConfig.DataQos.ReadMBPS = 10
-		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
-		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=write_mbps&value=20"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
+		// get config after reset
+		ds1.EXPECT().GetIoQos().Return(q1).AnyTimes()
+		ds2.EXPECT().GetIoQos().Return(q2).AnyTimes()
+		totalUrl = testServer.URL + "/config/get"
+		resp, err = HTTPRequest(http.MethodGet, totalUrl)
 		require.Nil(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, 200, resp.StatusCode)
 
-		lmt1 := q1.(*qos.IoQueueQos).GetBpsLimiter()
-		lmt2 := q2.(*qos.IoQueueQos).GetBpsLimiter()
-		require.Equal(t, int64(20*1024*1024), int64(lmt1[qos.LimitTypeWrite].Limit()))
-		require.Equal(t, svr.Conf.DiskConfig.DataQos.BackgroundMBPS*1024*1024, int64(lmt1[qos.LimitTypeBack].Limit()))
-		require.Equal(t, int64(20*1024*1024), int64(lmt2[qos.LimitTypeWrite].Limit()))
-		require.Equal(t, svr.Conf.DiskConfig.DataQos.BackgroundMBPS*1024*1024, int64(lmt2[qos.LimitTypeBack].Limit()))
-	}
-
-	{
-		// read_mbps
-		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
-		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=read_mbps&value=30"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
-		require.Nil(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, 200, resp.StatusCode)
-		retStr, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		require.NotEqual(t, "", retStr)
-
-		lmt1 := q1.(*qos.IoQueueQos).GetBpsLimiter()
-		lmt2 := q2.(*qos.IoQueueQos).GetBpsLimiter()
-		require.Equal(t, int64(30*1024*1024), int64(q1.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeRead].Limit()))
-		require.Equal(t, int64(20*1024*1024), int64(lmt1[qos.LimitTypeWrite].Limit()))
-		require.Equal(t, svr.Conf.DiskConfig.DataQos.BackgroundMBPS*1024*1024, int64(lmt1[qos.LimitTypeBack].Limit()))
-		require.Equal(t, int64(30*1024*1024), int64(q2.(*qos.IoQueueQos).GetBpsLimiter()[qos.LimitTypeRead].Limit()))
-		require.Equal(t, int64(20*1024*1024), int64(lmt2[qos.LimitTypeWrite].Limit()))
-		require.Equal(t, svr.Conf.DiskConfig.DataQos.BackgroundMBPS*1024*1024, int64(lmt2[qos.LimitTypeBack].Limit()))
-	}
-
-	{
-		// read discard
-		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
-		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=read_discard&value=70"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
-		require.Nil(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, 200, resp.StatusCode)
-
-		conf1 := q1.(*qos.IoQueueQos).GetConfig()
-		conf2 := q2.(*qos.IoQueueQos).GetConfig()
-		require.Equal(t, int32(70), conf1.ReadDiscard)
-		require.Equal(t, int32(70), conf2.ReadDiscard)
-	}
-
-	{
-		// write discard
-		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
-		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=write_discard&value=60"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
-		require.Nil(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, 200, resp.StatusCode)
-
-		conf1 := q1.(*qos.IoQueueQos).GetConfig()
-		conf2 := q2.(*qos.IoQueueQos).GetConfig()
-		require.Equal(t, int32(60), conf1.WriteDiscard)
-		require.Equal(t, int32(60), conf2.WriteDiscard)
-	}
-
-	{
-		// read queue cnt, concurrence
-		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
-		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=read_queue_depth&value=70"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
-		require.Nil(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, 200, resp.StatusCode)
-
-		conf1 := q1.(*qos.IoQueueQos).GetConfig()
-		conf2 := q2.(*qos.IoQueueQos).GetConfig()
-		require.Equal(t, int32(70), conf1.ReadQueueDepth)
-		require.Equal(t, int32(70), conf2.ReadQueueDepth)
-	}
-	{
-		// write queue cnt, concurrence
-		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
-		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=write_queue_depth&value=65"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
-		require.Nil(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, 200, resp.StatusCode)
-
-		conf1 := q1.(*qos.IoQueueQos).GetConfig()
-		conf2 := q2.(*qos.IoQueueQos).GetConfig()
-		require.Equal(t, int32(65), conf1.WriteQueueDepth)
-		require.Equal(t, int32(65), conf2.WriteQueueDepth)
-	}
-	{
-		// delete queue cnt, concurrence
-		ds1.EXPECT().GetIoQos().Return(q1).Times(1)
-		ds2.EXPECT().GetIoQos().Return(q2).Times(1)
-		totalUrl := testServer.URL + "/config/reload?key=delete_queue_depth&value=66"
-		resp, err := HTTPRequest(http.MethodPost, totalUrl)
-		require.Nil(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, 200, resp.StatusCode)
-
-		conf1 := q1.(*qos.IoQueueQos).GetConfig()
-		conf2 := q2.(*qos.IoQueueQos).GetConfig()
-		require.Equal(t, int32(66), conf1.DeleteQueueDepth)
-		require.Equal(t, int32(66), conf2.DeleteQueueDepth)
-	}
-
-	{
-		// get config
-		ds1.EXPECT().GetIoQos().Return(q1).MaxTimes(1)
-		ds2.EXPECT().GetIoQos().Return(q2).MaxTimes(1)
-		totalUrl := testServer.URL + "/config/get"
-		resp, err := HTTPRequest(http.MethodGet, totalUrl)
-		require.Nil(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, 200, resp.StatusCode)
-		retData, err := io.ReadAll(resp.Body)
+		dest := qos.FlowConfig{}
+		err = json.Unmarshal(body, &dest)
 		require.NoError(t, err)
-		qosConf := qos.Config{}
-		err = json.Unmarshal(retData, &qosConf)
-		require.NoError(t, err)
-		require.Equal(t, int64(30), qosConf.ReadMBPS)
-		require.Equal(t, int64(20), qosConf.WriteMBPS)
-		require.Equal(t, int64(10), qosConf.BackgroundMBPS)
+		log.Infof("qos mgr config: %+v\n", dest)
+		require.Equal(t, int64(17), dest.CommonDiskConfig.DiskBandwidthMB)
+		require.Equal(t, int64(13), dest.Level[bnapi.ReadIO.String()].MBPS)
 	}
 }
 
@@ -1121,7 +1033,7 @@ func TestService_RegisterNode(t *testing.T) {
 
 	// first register
 	svr.Conf.DiskType = proto.DiskTypeHDD
-	err := registerNode(ctx, svr.ClusterMgrClient, svr.Conf)
+	err := svr.registerNode(ctx, svr.Conf)
 	require.NoError(t, err)
 	require.Equal(t, proto.NodeID(1), svr.Conf.HostInfo.NodeID)
 
@@ -1136,12 +1048,430 @@ func TestService_RegisterNode(t *testing.T) {
 		Conf:             &conf2,
 	}
 	svr2.Conf.DiskType = proto.DiskTypeSSD
-	err = registerNode(ctx, svr2.ClusterMgrClient, svr2.Conf)
+	err = svr2.registerNode(ctx, svr2.Conf)
 	require.NoError(t, err)
 	require.Equal(t, proto.NodeID(2), svr2.Conf.HostInfo.NodeID)
 	require.NotEqual(t, svr.Conf.NodeID, svr2.Conf.NodeID)
 
 	svr.Conf.DiskType = 0
-	err = registerNode(ctx, svr.ClusterMgrClient, svr.Conf)
+	err = svr.registerNode(ctx, svr.Conf)
 	require.NotNil(t, err)
+}
+
+func TestService_OnlyWorker(t *testing.T) {
+	mcm := mockClusterMgr{
+		reqIdx: _mockDiskIdBase,
+		disks:  []mockDiskInfo{},
+	}
+
+	mcmURL := runMockClusterMgr(&mcm)
+
+	cc := &cmapi.Config{}
+	cc.Hosts = []string{mcmURL}
+
+	conf := Config{
+		Clustermgr: cc,
+		StartMode:  proto.ServiceNameWorker,
+	}
+
+	svr, err := NewService(conf)
+	require.NoError(t, err)
+	svr.Close()
+
+	// retart
+	_, err = NewService(conf)
+	require.NoError(t, err)
+}
+
+func TestService_OnlyBlobnode(t *testing.T) {
+	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"OnlyBlobnode")
+	require.NoError(t, err)
+	defer os.RemoveAll(workDir)
+
+	path1 := filepath.Join(workDir, "disk1")
+	path2 := filepath.Join(workDir, "disk2")
+
+	mcm := mockClusterMgr{
+		reqIdx: _mockDiskIdBase,
+		disks:  []mockDiskInfo{},
+	}
+
+	mcmURL := runMockClusterMgr(&mcm)
+
+	cc := &cmapi.Config{}
+	cc.Hosts = []string{mcmURL}
+
+	err = os.MkdirAll(workDir, 0o755)
+	require.NoError(t, err)
+
+	// must create meta dir
+	err = os.MkdirAll(core.GetMetaPath(path1, ""), 0o755)
+	require.NoError(t, err)
+	err = os.MkdirAll(core.GetMetaPath(path2, ""), 0o755)
+	require.NoError(t, err)
+
+	conf := Config{
+		HostInfo: core.HostInfo{
+			IDC:      "testIdc",
+			Rack:     "testRack",
+			DiskType: proto.DiskTypeHDD,
+		},
+		Disks: []core.Config{
+			{BaseConfig: core.BaseConfig{Path: path1, AutoFormat: true, MaxChunks: 700}, MetaConfig: db.MetaConfig{}},
+			{BaseConfig: core.BaseConfig{Path: path2, AutoFormat: true, MaxChunks: 700}, MetaConfig: db.MetaConfig{}},
+		},
+		DiskConfig:           core.RuntimeConfig{DiskReservedSpaceB: 1, CompactReservedSpaceB: 1},
+		Clustermgr:           cc,
+		HeartbeatIntervalSec: 600,
+		StartMode:            proto.ServiceNameBlobNode,
+	}
+
+	svr, err := NewService(conf)
+	require.NoError(t, err)
+	svr.Close()
+
+	// restart
+	_, err = NewService(conf)
+	require.NoError(t, err)
+}
+
+func TestService_OnlyBlobnode_OpenFailedEIO(t *testing.T) {
+	ctx := context.Background()
+	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"OnlyBlobnode")
+	require.NoError(t, err)
+	defer os.RemoveAll(workDir)
+
+	path1 := filepath.Join(workDir, "path1")
+	path2 := filepath.Join(workDir, "path2")
+	path3 := filepath.Join(workDir, "path3")
+	path4 := filepath.Join(workDir, "path4")
+	for _, path := range []string{workDir, path1, path2, path3, path4} {
+		err = os.MkdirAll(path, 0o755)
+		require.NoError(t, err)
+	}
+
+	conf := Config{
+		HostInfo: core.HostInfo{
+			IDC:      "testIdc",
+			Rack:     "testRack",
+			DiskType: proto.DiskTypeHDD,
+		},
+		Disks: []core.Config{
+			{BaseConfig: core.BaseConfig{Path: path1, AutoFormat: true, MaxChunks: 700}, MetaConfig: db.MetaConfig{}},
+			{BaseConfig: core.BaseConfig{Path: path2, AutoFormat: true, MaxChunks: 700}, MetaConfig: db.MetaConfig{}},
+		},
+		DiskConfig:           core.RuntimeConfig{DiskReservedSpaceB: 1, CompactReservedSpaceB: 1},
+		HeartbeatIntervalSec: 600,
+	}
+
+	// open readFormat eio, report broken disk
+	diskInfo1 := &cmapi.BlobNodeDiskInfo{
+		DiskInfo: cmapi.DiskInfo{
+			Path:   path1,
+			Status: proto.DiskStatusNormal,
+		},
+		DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{DiskID: proto.DiskID(1)},
+	}
+	// open readFormat eio, status repaired, skip
+	diskInfo2 := &cmapi.BlobNodeDiskInfo{
+		DiskInfo: cmapi.DiskInfo{
+			Path:   path2,
+			Status: proto.DiskStatusRepaired,
+		},
+		DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{DiskID: proto.DiskID(2)},
+	}
+
+	A := gomock.Any()
+	ctr := gomock.NewController(t)
+	cmCli := mocks.NewMockClientAPI(ctr)
+	cmCli.EXPECT().GetConfig(A, A).Return("[]", nil).AnyTimes()
+	cmCli.EXPECT().RegisterService(A, A, A, A, A).Return(nil).Times(2)
+	cmCli.EXPECT().AddNode(A, A).Return(proto.NodeID(1), nil).Times(2)
+	cmCli.EXPECT().ListHostDisk(A, A).Return([]*cmapi.BlobNodeDiskInfo{diskInfo1, diskInfo2}, nil)
+	cmCli.EXPECT().SetDisk(A, A, A).Return(nil)
+
+	patches := gomonkey.ApplyFunc(readFormatInfo, func(ctx context.Context, path string) (*core.FormatInfo, error) {
+		if path == path1 || path == path2 {
+			return nil, syscall.EIO
+		}
+		return &core.FormatInfo{CheckSum: 1}, nil
+	})
+	defer patches.Reset()
+	patches2 := gomonkey.ApplyFunc(disk.NewDiskStorage, func(ctx context.Context, diskConf core.Config) (*disk.DiskStorageWrapper, error) {
+		if diskConf.Path == path3 || diskConf.Path == path4 {
+			return nil, syscall.EIO
+		}
+		disk2 := &disk.DiskStorageWrapper{DiskStorage: &disk.DiskStorage{DiskID: proto.DiskID(2)}}
+		return disk2, nil
+	})
+	defer patches2.Reset()
+
+	configInit(&conf)
+	svr := &Service{
+		ClusterMgrClient: cmCli,
+		Disks:            make(map[proto.DiskID]core.DiskAPI),
+		Conf:             &conf,
+		closeCh:          make(chan struct{}),
+	}
+	svr.ctx, svr.cancel = context.WithCancel(ctx)
+
+	err = startBlobnodeService(ctx, svr, conf)
+	require.Nil(t, err)
+	require.Equal(t, 0, len(svr.Disks))
+
+	conf.Disks = []core.Config{
+		{BaseConfig: core.BaseConfig{Path: path3, AutoFormat: true}, MetaConfig: db.MetaConfig{}},
+	}
+	svr.Conf = &conf
+
+	// newDiskStorage status repaired, skip
+	diskInfo3 := &cmapi.BlobNodeDiskInfo{
+		DiskInfo: cmapi.DiskInfo{
+			Path:   path3,
+			Status: proto.DiskStatusRepaired,
+		},
+		DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{DiskID: proto.DiskID(3)},
+	}
+	cmCli.EXPECT().ListHostDisk(A, A).Return([]*cmapi.BlobNodeDiskInfo{diskInfo3}, nil)
+	err = startBlobnodeService(ctx, svr, conf)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(svr.Disks))
+}
+
+func TestService_OnlyBlobnode_OpenDiskNormal(t *testing.T) {
+	ctx := context.Background()
+	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"OnlyBlobnode")
+	require.NoError(t, err)
+	defer os.RemoveAll(workDir)
+
+	path1 := filepath.Join(workDir, "path1")
+	err = os.MkdirAll(path1, 0o755)
+	require.NoError(t, err)
+
+	conf := Config{
+		Disks: []core.Config{{BaseConfig: core.BaseConfig{Path: path1, AutoFormat: true, MaxChunks: 700}, MetaConfig: db.MetaConfig{}}},
+	}
+
+	// open disk success
+	diskInfo1 := &cmapi.BlobNodeDiskInfo{
+		DiskInfo: cmapi.DiskInfo{
+			Path:   path1,
+			Status: proto.DiskStatusRepaired,
+		},
+		DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{DiskID: proto.DiskID(1)},
+	}
+
+	A := gomock.Any()
+	ctr := gomock.NewController(t)
+	cmCli := mocks.NewMockClientAPI(ctr)
+	cmCli.EXPECT().GetConfig(A, A).Return("[]", nil).AnyTimes()
+	cmCli.EXPECT().RegisterService(A, A, A, A, A).Return(nil).Times(1)
+	cmCli.EXPECT().AddNode(A, A).Return(proto.NodeID(1), nil).Times(1)
+	cmCli.EXPECT().ListHostDisk(A, A).Return([]*cmapi.BlobNodeDiskInfo{diskInfo1}, nil)
+	cmCli.EXPECT().AllocDiskID(A).Return(proto.DiskID(101), nil)
+	cmCli.EXPECT().AddDisk(A, A).Return(nil)
+
+	configInit(&conf)
+	svr := &Service{
+		ClusterMgrClient: cmCli,
+		Disks:            make(map[proto.DiskID]core.DiskAPI),
+		Conf:             &conf,
+		closeCh:          make(chan struct{}),
+	}
+	svr.ctx, svr.cancel = context.WithCancel(ctx)
+
+	err = startBlobnodeService(ctx, svr, conf)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(svr.Disks))
+}
+
+func TestService_OnlyBlobnode_Fatal(t *testing.T) {
+	ctx := context.Background()
+	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"OnlyBlobnode")
+	require.NoError(t, err)
+	defer os.RemoveAll(workDir)
+
+	path1 := filepath.Join(workDir, "path1")
+	path2 := filepath.Join(workDir, "path2")
+	for _, path := range []string{path1, path2} {
+		err = os.MkdirAll(path, 0o755)
+		require.NoError(t, err)
+	}
+
+	conf := Config{
+		Disks: []core.Config{
+			{BaseConfig: core.BaseConfig{Path: path1, AutoFormat: true, MaxChunks: 700}, MetaConfig: db.MetaConfig{}},
+			// {BaseConfig: core.BaseConfig{Path: path2, AutoFormat: true}, MetaConfig: db.MetaConfig{}},
+			// {BaseConfig: core.BaseConfig{Path: "wrongPath", AutoFormat: true}, MetaConfig: db.MetaConfig{}},
+		},
+	}
+
+	// new disk, read meta fake error
+	diskInfo1 := &cmapi.BlobNodeDiskInfo{
+		DiskInfo: cmapi.DiskInfo{
+			Path:   path1,
+			Status: proto.DiskStatusRepaired,
+		},
+		DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{DiskID: proto.DiskID(1)},
+	}
+	// old disk is repairing
+	diskInfo2 := &cmapi.BlobNodeDiskInfo{
+		DiskInfo: cmapi.DiskInfo{
+			Path:   path2,
+			Status: proto.DiskStatusRepairing,
+		},
+		DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{DiskID: proto.DiskID(2)},
+	}
+
+	A := gomock.Any()
+	ctr := gomock.NewController(t)
+	cmCli := mocks.NewMockClientAPI(ctr)
+	cmCli.EXPECT().GetConfig(A, A).Return("[]", nil).AnyTimes()
+	cmCli.EXPECT().RegisterService(A, A, A, A, A).Return(nil).Times(1)
+	cmCli.EXPECT().AddNode(A, A).Return(proto.NodeID(1), nil).Times(1)
+	cmCli.EXPECT().ListHostDisk(A, A).Return([]*cmapi.BlobNodeDiskInfo{diskInfo1, diskInfo2}, nil)
+	// cmCli.EXPECT().AllocDiskID(A).Return(proto.DiskID(102), nil)
+
+	patches := gomonkey.ApplyFunc(readFormatInfo, func(ctx context.Context, path string) (*core.FormatInfo, error) {
+		if path == path1 {
+			return nil, errMock
+		}
+		return &core.FormatInfo{}, nil
+	})
+	defer patches.Reset()
+
+	mockSpan := opentracing.GlobalTracer().StartSpan("")
+	patches2 := gomonkey.ApplyMethod(reflect.TypeOf(mockSpan), "Fatalf", func(xx interface{}, format string, v ...interface{}) {
+		fmt.Println("startBlobnodeService fatal")
+	})
+	defer patches2.Reset()
+
+	configInit(&conf)
+	svr := &Service{
+		ClusterMgrClient: cmCli,
+		Disks:            make(map[proto.DiskID]core.DiskAPI),
+		Conf:             &conf,
+		closeCh:          make(chan struct{}),
+	}
+	svr.ctx, svr.cancel = context.WithCancel(ctx)
+
+	// require.Panics(t, func() { startBlobnodeService(ctx, svr, conf) })
+	err = startBlobnodeService(ctx, svr, conf)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(svr.Disks))
+}
+
+func TestService_OnlyBlobnode_OpenOldDisk(t *testing.T) {
+	ctx := context.Background()
+	workDir, err := os.MkdirTemp(os.TempDir(), defaultSvrTestDir+"OnlyBlobnode")
+	require.NoError(t, err)
+	defer os.RemoveAll(workDir)
+
+	path1 := filepath.Join(workDir, "path1")
+	err = os.MkdirAll(path1, 0o755)
+	require.NoError(t, err)
+
+	conf := Config{
+		Disks: []core.Config{
+			{BaseConfig: core.BaseConfig{Path: path1, AutoFormat: true, MaxChunks: 700}, MetaConfig: db.MetaConfig{}},
+		},
+	}
+
+	// old disk, repairing, skip
+	diskInfo1 := &cmapi.BlobNodeDiskInfo{
+		DiskInfo: cmapi.DiskInfo{
+			Path:   path1,
+			Status: proto.DiskStatusRepairing,
+		},
+		DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{DiskID: proto.DiskID(1)},
+	}
+
+	A := gomock.Any()
+	ctr := gomock.NewController(t)
+	cmCli := mocks.NewMockClientAPI(ctr)
+	cmCli.EXPECT().GetConfig(A, A).Return("[]", nil).AnyTimes()
+	cmCli.EXPECT().RegisterService(A, A, A, A, A).Return(nil).Times(1)
+	cmCli.EXPECT().AddNode(A, A).Return(proto.NodeID(1), nil).Times(1)
+	cmCli.EXPECT().ListHostDisk(A, A).Return([]*cmapi.BlobNodeDiskInfo{diskInfo1}, nil)
+
+	format := &core.FormatInfo{
+		FormatInfoProtectedField: core.FormatInfoProtectedField{
+			DiskID:  proto.DiskID(1),
+			Version: 1,
+			Format:  core.FormatMetaTypeV1,
+		},
+	}
+	checkSum, err := format.CalCheckSum()
+	require.NoError(t, err)
+	format.CheckSum = checkSum
+	err = core.SaveDiskFormatInfo(ctx, path1, format)
+	require.NoError(t, err)
+
+	configInit(&conf)
+	svr := &Service{
+		ClusterMgrClient: cmCli,
+		Disks:            make(map[proto.DiskID]core.DiskAPI),
+		Conf:             &conf,
+		closeCh:          make(chan struct{}),
+	}
+	svr.ctx, svr.cancel = context.WithCancel(ctx)
+
+	err = startBlobnodeService(ctx, svr, conf)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(svr.Disks))
+}
+
+func TestService_DataInspect(t *testing.T) {
+	ctr := gomock.NewController(t)
+	ds1 := NewMockDiskAPI(ctr)
+	svr := &Service{
+		Disks: map[proto.DiskID]core.DiskAPI{2: ds1},
+	}
+	testServer := httptest.NewServer(NewHandler(svr))
+
+	{
+		ds1.EXPECT().ID().Return(proto.DiskID(2))
+		ds1.EXPECT().DiskInfo().Return(cmapi.BlobNodeDiskInfo{
+			DiskInfo: cmapi.DiskInfo{
+				ClusterID: 1,
+			},
+			DiskHeartBeatInfo: cmapi.DiskHeartBeatInfo{
+				DiskID: 2,
+			},
+		})
+
+		totalUrl := testServer.URL + "/inspect/cleanmetric?diskid=2"
+		resp, err := HTTPRequest(http.MethodPost, totalUrl)
+		require.Nil(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, 200, resp.StatusCode)
+	}
+
+	{
+		// get inspect stats
+		getter := mocks.NewMockAccessor(ctr)
+		getter.EXPECT().GetConfig(any, any).AnyTimes().Return("", nil)
+		ts, err := taskswitch.NewSwitchMgr(getter).AddSwitch(proto.TaskSwitchDataInspect.String())
+		require.NoError(t, err)
+		svr.inspectMgr = &DataInspectMgr{
+			// progress:   map[proto.DiskID]int{101: 85, 202: 95},
+			taskSwitch: ts,
+			conf:       DataInspectConf{RateLimit: 4096},
+		}
+		svr.inspectMgr.progress.Store(proto.DiskID(101), 88)
+		svr.inspectMgr.progress.Store(proto.DiskID(202), 99)
+
+		totalUrl := testServer.URL + "/inspect/stat"
+		resp, err := HTTPRequest(http.MethodGet, totalUrl)
+		require.Nil(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, 200, resp.StatusCode)
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		var data DataInspectStat
+		err = json.Unmarshal(body, &data)
+		require.NoError(t, err)
+		log.Infof("inspect stat: %+v\n", data)
+	}
 }

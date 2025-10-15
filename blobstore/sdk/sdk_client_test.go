@@ -411,7 +411,7 @@ func TestSdkBlob_Get(t *testing.T) {
 	// err
 	_, err = hd.GetBlob(ctx, &acapi.GetBlobArgs{
 		ClusterID: 0,
-		BlobName:  nil,
+		BlobName:  "",
 	})
 	require.NotNil(t, err)
 	require.ErrorIs(t, err, errcode.ErrIllegalArguments)
@@ -419,7 +419,7 @@ func TestSdkBlob_Get(t *testing.T) {
 	// err mock
 	args := &acapi.GetBlobArgs{
 		ClusterID: 1,
-		BlobName:  []byte("blob1"),
+		BlobName:  ("blob1"),
 		Mode:      acapi.GetShardModeRandom,
 		Offset:    0,
 	}
@@ -470,7 +470,7 @@ func TestSdkBlob_Get(t *testing.T) {
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().GetBlob(gAny, gAny).Return(&loc, nil)
 	_, err = hd.GetBlob(ctx, &acapi.GetBlobArgs{
 		ClusterID: 1,
-		BlobName:  []byte("blob1"),
+		BlobName:  ("blob1"),
 		ReadSize:  args.ReadSize,
 	})
 	require.NoError(t, err)
@@ -646,7 +646,7 @@ func TestSdkBlob_Create(t *testing.T) {
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().CreateBlob(gAny, gAny).Return(nil, errMock)
 	args.CodeMode = codemode.EC3P3
 	args.Size = 1
-	args.BlobName = []byte("blob1")
+	args.BlobName = ("blob1")
 	_, err = hd.createBlob(ctx, args)
 	require.NotNil(t, err)
 	require.ErrorIs(t, err, errMock)
@@ -680,7 +680,7 @@ func TestSdkBlob_Seal(t *testing.T) {
 	// empty slice
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().SealBlob(gAny, gAny).Return(nil)
 	args.ClusterID = 1
-	args.BlobName = []byte("blob1")
+	args.BlobName = ("blob1")
 	err = hd.sealBlob(ctx, args)
 	require.NoError(t, err)
 
@@ -713,7 +713,7 @@ func TestSdkBlob_Delete(t *testing.T) {
 
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().DeleteBlob(gAny, gAny).Return(errMock)
 	args.ClusterID = 1
-	args.BlobName = []byte("blob1")
+	args.BlobName = ("blob1")
 	err = hd.DeleteBlob(ctx, args)
 	require.NotNil(t, err)
 	require.ErrorIs(t, err, errMock)
@@ -734,11 +734,10 @@ func TestSdkBlob_Put(t *testing.T) {
 	require.ErrorIs(t, err, errcode.ErrIllegalArguments)
 
 	args = &acapi.PutBlobArgs{
-		BlobName:  []byte("blob1"),
-		CodeMode:  codemode.EC3P3,
-		NeedSeal:  false,
-		ShardKeys: nil,
-		Hashes:    0,
+		BlobName: ("blob1"),
+		CodeMode: codemode.EC3P3,
+		NeedSeal: false,
+		Hashes:   0,
 	}
 	data := "test_put1"
 	args.Body = bytes.NewBuffer([]byte(data))
@@ -773,7 +772,7 @@ func TestSdkBlob_Put(t *testing.T) {
 
 	// put fail, not have read, return EOF
 	args.Hashes = 0
-	args.BlobName = []byte("blob0")
+	args.BlobName = ("blob0")
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().CreateBlob(gAny, gAny).Return(loca, nil)
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().DeleteBlob(gAny, gAny).Return(nil)
 	cid, hashes, err = hd.PutBlob(ctx, args)
@@ -792,7 +791,7 @@ func TestSdkBlob_Put(t *testing.T) {
 
 	// put ok, seal fail
 	args.Hashes = 0
-	args.BlobName = []byte("blob0")
+	args.BlobName = ("blob0")
 	args.Body = bytes.NewBuffer([]byte(data))
 	args.NeedSeal = true
 	loc2 := &proto.Location{
@@ -852,7 +851,6 @@ func TestSdkBlob_Put(t *testing.T) {
 	allocArgs := acapi.AllocSliceArgs{
 		ClusterID: loc2.ClusterID,
 		BlobName:  args.BlobName,
-		ShardKeys: args.ShardKeys,
 		CodeMode:  loc2.CodeMode,
 		Size:      uint64(len(data)),
 		FailSlice: proto.Slice{MinSliceID: 1, Vid: 10, Count: 0, ValidSize: 0},
@@ -874,7 +872,7 @@ func TestSdkBlob_Put(t *testing.T) {
 
 	// split slice. blobID 2 fail
 	hd.conf.MaxRetry = 3
-	args.BlobName = []byte("blob2")
+	args.BlobName = ("blob2")
 	data = "test_put2"
 	args.Body = bytes.NewBuffer([]byte(data))
 	locb := &proto.Location{
@@ -934,7 +932,7 @@ func TestSdkBlob_Put(t *testing.T) {
 	// first slice idx fail(blobID 1 fail), retry alloc all slices
 	hd.conf.MaxRetry = 3
 	data = "test_put3"
-	args.BlobName = []byte("blob3")
+	args.BlobName = ("blob3")
 	args.Body = bytes.NewBuffer([]byte(data))
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().CreateBlob(gAny, gAny).Return(locb, nil)
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().PutAt(gAny, gAny, gAny, gAny, gAny, gAny, gAny).Return(errMock) // .Times(hd.conf.MaxRetry)
@@ -971,7 +969,7 @@ func TestSdkBlob_Put(t *testing.T) {
 	// last slice idx fail(blobID 11 fail), retry alloc last blobId of last slice
 	hd.conf.MaxRetry = 3
 	data = "test_put4"
-	args.BlobName = []byte("blob4")
+	args.BlobName = ("blob4")
 	args.Body = bytes.NewBuffer([]byte(data))
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().CreateBlob(gAny, gAny).Return(locb, nil)
 	wt = bytes.NewBuffer(nil)
@@ -1016,7 +1014,7 @@ func TestSdkBlob_Put(t *testing.T) {
 	locb.Slices[1].ValidSize = 0
 	hd.conf.MaxRetry = 1
 	data = "test_put5"
-	args.BlobName = []byte("blob5")
+	args.BlobName = ("blob5")
 	args.Body = bytes.NewBuffer([]byte(data))
 	hd.handler.(*mocks.MockStreamHandler).EXPECT().CreateBlob(gAny, gAny).Return(locb, nil)
 	wt = bytes.NewBuffer(nil)

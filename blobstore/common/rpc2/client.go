@@ -185,10 +185,10 @@ func (c *Client) do(req *Request, ret Unmarshaler) (*Response, error) {
 	span.Debugf("get connection -> stream(%d, %v, %v)",
 		conn.ID(), conn.LocalAddr(), conn.RemoteAddr())
 
-	resp, err := req.request(c.requestDeadline(req.Context()))
+	resp, broken, err := req.request(c.requestDeadline(req.Context()))
 	if err != nil {
-		span.Warn("send request ->", err)
-		c.Connector.Put(req.Context(), req.conn, true)
+		span.Warn("send request ->", broken, err)
+		c.Connector.Put(req.Context(), req.conn, broken)
 		return nil, err
 	}
 	if err = resp.ParseResult(ret); err != nil {
@@ -245,7 +245,7 @@ func NewRequest(ctx context.Context, addr, path string, para Marshaler, body io.
 	ctx = ContextWithTrace(ctx)
 	rc, ok := body.(io.ReadCloser)
 	if !ok && body != nil {
-		rc = io.NopCloser(body)
+		rc = NopCloser(body)
 	}
 	if para == nil {
 		para = NoParameter
@@ -275,7 +275,6 @@ func NewRequest(ctx context.Context, addr, path string, para Marshaler, body io.
 	req.RemoteAddr = addr
 	req.ctx = ctx
 	req.Body = clientNopBody(rc)
-	req.AfterBody = func() error { return nil }
 
 	if body != nil {
 		switch v := body.(type) {
@@ -304,7 +303,7 @@ func NewRequest(ctx context.Context, addr, path string, para Marshaler, body io.
 			req.ContentLength = int64(v.Size())
 			marshaler := v.marshaler
 			req.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(Codec2Reader(marshaler)), nil
+				return NopCloser(Codec2Reader(marshaler)), nil
 			}
 		default:
 		}

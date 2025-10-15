@@ -175,6 +175,18 @@ func (s *service) GetShard(diskID proto.DiskID, suid proto.Suid) (storage.ShardH
 	return sh, nil
 }
 
+func (s *service) GetAllShards() []storage.ShardHandler {
+	shards := make([]storage.ShardHandler, 0)
+	disks := s.getAllDisks()
+	for _, d := range disks {
+		d.RangeShard(func(s storage.ShardHandler) bool {
+			shards = append(shards, s)
+			return true
+		})
+	}
+	return shards
+}
+
 func (s *service) loop(ctx context.Context) {
 	heartbeatTicker := time.NewTicker(time.Duration(s.cfg.HeartBeatIntervalS) * time.Second)
 	reportTicker := time.NewTicker(time.Duration(s.cfg.ReportIntervalS) * time.Second)
@@ -190,6 +202,7 @@ func (s *service) loop(ctx context.Context) {
 	}()
 
 	var span trace.Span
+	span, ctx = trace.StartSpanFromContext(ctx, "")
 	diskReports := make([]clustermgr.ShardNodeDiskHeartbeatInfo, 0)
 	shardReports := make([]clustermgr.ShardUnitInfo, 0, 1<<10)
 	shards := make([]storage.ShardHandler, 0, 1<<10)
@@ -198,7 +211,6 @@ func (s *service) loop(ctx context.Context) {
 	for {
 		select {
 		case <-heartbeatTicker.C:
-			span, ctx = trace.StartSpanFromContext(ctx, "")
 			diskReports = diskReports[:0]
 
 			disks := s.getAllDisks()

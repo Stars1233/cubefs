@@ -40,22 +40,32 @@ func (s *service) createBlob(ctx context.Context, req *shardnode.CreateBlobArgs)
 	return space.CreateBlob(ctx, req)
 }
 
-func (s *service) deleteBlob(ctx context.Context, req *shardnode.DeleteBlobArgs) error {
+func (s *service) deleteBlob(ctx context.Context, req *shardnode.DeleteBlobArgs) (blob shardnode.GetBlobRet, err error) {
 	sid := req.Header.SpaceID
 	space, err := s.catalog.GetSpace(ctx, sid)
 	if err != nil {
-		return err
+		return
 	}
-	return space.DeleteBlob(ctx, req)
-}
 
-func (s *service) findAndDeleteBlob(ctx context.Context, req *shardnode.DeleteBlobArgs) (blob shardnode.GetBlobRet, err error) {
-	sid := req.Header.SpaceID
-	space, err := s.catalog.GetSpace(ctx, sid)
+	blob, err = space.GetBlob(ctx, &shardnode.GetBlobArgs{
+		Header: req.Header,
+		Name:   req.Name,
+	})
 	if err != nil {
-		return shardnode.GetBlobRet{}, err
+		return
 	}
-	return space.FindAndDeleteBlob(ctx, req)
+
+	tagNum, err := space.GetShardingSubRangeCount(req.Header.DiskID, req.Header.Suid)
+	if err != nil {
+		return
+	}
+	shardKeys := shardnode.DecodeShardKeys(req.Name, tagNum)
+
+	items, err := s.blobDelMgr.SlicesToDeleteMsgItems(ctx, blob.Blob.Location.Slices, shardKeys)
+	if err != nil {
+		return
+	}
+	return blob, space.DeleteBlob(ctx, req, items)
 }
 
 func (s *service) sealBlob(ctx context.Context, req *shardnode.SealBlobArgs) error {
@@ -98,4 +108,12 @@ func (s *service) allocSlice(ctx context.Context, req *shardnode.AllocSliceArgs)
 		return
 	}
 	return space.AllocSlice(ctx, req)
+}
+
+func (s *service) deleteBlobRaw(ctx context.Context, req *shardnode.DeleteBlobRawArgs) error {
+	return s.blobDelMgr.Delete(ctx, req)
+}
+
+func (s *service) deleteBlobStats() *shardnode.DeleteBlobStatsRet {
+	return s.blobDelMgr.Stats()
 }

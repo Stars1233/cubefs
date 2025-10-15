@@ -65,6 +65,10 @@ type InspectRateArgs struct {
 	Rate int `json:"rate"`
 }
 
+type InspectCleanMetricArgs struct {
+	DiskID proto.DiskID `json:"diskid"`
+}
+
 type DiskStatArgs struct {
 	DiskID proto.DiskID `json:"diskid"`
 }
@@ -98,6 +102,7 @@ type StorageAPI interface {
 	// shard
 	GetShard(ctx context.Context, host string, args *GetShardArgs) (body io.ReadCloser, shardCrc uint32, err error)
 	RangeGetShard(ctx context.Context, host string, args *RangeGetShardArgs) (body io.ReadCloser, shardCrc uint32, err error)
+	GetShards(ctx context.Context, host string, args *GetShardsArgs) (getter ShardGetter, err error)
 	PutShard(ctx context.Context, host string, args *PutShardArgs) (crc uint32, err error)
 	StatShard(ctx context.Context, host string, args *StatShardArgs) (si *ShardInfo, err error)
 	MarkDeleteShard(ctx context.Context, host string, args *DeleteShardArgs) (err error)

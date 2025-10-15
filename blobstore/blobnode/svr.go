@@ -44,18 +44,16 @@ type Service struct {
 	WorkerService *WorkerService
 
 	// client handler
-	ClusterMgrClient *cmapi.Client
+	ClusterMgrClient cmapi.APIBlobnode
 
 	Conf       *Config
 	inspectMgr *DataInspectMgr
 
 	// limiter
-	DeleteQpsLimitPerKey  limit.Limiter
-	DeleteQpsLimitPerDisk limit.ResettableLimiter
-	ChunkLimitPerVuid     limit.Limiter
-	DiskLimitRegister     limit.Limiter
-	InspectLimiterPerKey  limit.Limiter
-	BrokenLimitPerDisk    limit.Limiter
+	ChunkLimitPerVuid    limit.Limiter
+	DiskLimitRegister    limit.Limiter
+	InspectLimiterPerKey limit.Limiter
+	BrokenLimitPerDisk   limit.Limiter
 
 	RequestCount int64
 
@@ -137,7 +135,9 @@ func (s *Service) Close() {
 
 	s.closed = true
 
-	s.WorkerService.Close()
+	if s.WorkerService != nil {
+		s.WorkerService.Close()
+	}
 
 	span.Info("service close done.")
 }

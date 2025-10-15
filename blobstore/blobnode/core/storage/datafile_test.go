@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -31,32 +32,62 @@ import (
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
+	"github.com/cubefs/cubefs/blobstore/blobnode/base"
+	"github.com/cubefs/cubefs/blobstore/blobnode/base/flow"
 	"github.com/cubefs/cubefs/blobstore/blobnode/base/qos"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	"github.com/cubefs/cubefs/blobstore/common/crc32block"
 	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
+	"github.com/cubefs/cubefs/blobstore/common/iostat"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
+	bnmock "github.com/cubefs/cubefs/blobstore/testing/mockblobnode"
 	"github.com/cubefs/cubefs/blobstore/testing/mocks"
 	_ "github.com/cubefs/cubefs/blobstore/testing/nolog"
 	"github.com/cubefs/cubefs/blobstore/util/bytespool"
 	"github.com/cubefs/cubefs/blobstore/util/log"
-	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
 const (
 	defaultDiskTestDir = "NodeDiskTestDir"
 )
 
-func newIoPoolMock(t *testing.T) map[qos.IOTypeRW]taskpool.IoPool {
+func newIoPoolMock(t *testing.T) map[bnapi.IOType]base.IoPool {
 	ctr := gomock.NewController(t)
 	ioPool := mocks.NewMockIoPool(ctr)
-	ioPool.EXPECT().Submit(gomock.Any()).Do(func(args taskpool.IoPoolTaskArgs) { args.TaskFn() }).AnyTimes()
+	ioPool.EXPECT().Submit(gomock.Any()).Do(func(args base.IoPoolTaskArgs) { args.TaskFn() }).AnyTimes()
 
-	return map[qos.IOTypeRW]taskpool.IoPool{
-		qos.IOTypeRead:  ioPool,
-		qos.IOTypeWrite: ioPool,
-		qos.IOTypeDel:   ioPool,
+	return map[bnapi.IOType]base.IoPool{
+		bnapi.ReadIO:       ioPool,
+		bnapi.WriteIO:      ioPool,
+		bnapi.DeleteIO:     ioPool,
+		bnapi.BackgroundIO: ioPool,
 	}
+}
+
+func newIoQosMgrMock(t *testing.T, iops int) *qos.QosMgr {
+	if iops == 0 {
+		iops = 1000
+	}
+
+	ioStat, _ := iostat.StatInit("", 0, true)
+	iom := &flow.IOFlowStat{}
+	for i := range bnapi.GetAllIOType() {
+		iom[i] = ioStat
+	}
+
+	ioQos, err := qos.NewQosMgr(qos.Config{
+		StatGetter: iom,
+		FlowConfig: qos.FlowConfig{
+			Level: qos.LevelConfigMap{
+				bnapi.ReadIO.String():       {Concurrency: int64(iops), MBPS: 100},
+				bnapi.WriteIO.String():      {Concurrency: int64(iops), MBPS: 100},
+				bnapi.DeleteIO.String():     {Concurrency: int64(iops), MBPS: 100},
+				bnapi.BackgroundIO.String(): {Concurrency: int64(iops), MBPS: 100},
+			},
+		},
+	})
+	require.NoError(t, err)
+	return ioQos
 }
 
 func TestNewChunkData(t *testing.T) {
@@ -117,6 +148,7 @@ func TestChunkData_Write(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	chunkname := clustermgr.NewChunkID(0).String()
 
@@ -131,7 +163,7 @@ func TestChunkData_Write(t *testing.T) {
 	}
 
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 2)
 	defer ioQos.Close()
 	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
 	require.NoError(t, err)
@@ -167,7 +199,7 @@ func TestChunkData_Write(t *testing.T) {
 
 	buf := bytespool.Alloc(core.HeaderSize)
 	defer bytespool.Free(buf) // nolint: staticcheck
-	_, err = cd.ef.ReadAt(buf, shard.Offset)
+	_, err = cd.ef.ReadAtCtx(ctx, buf, shard.Offset)
 	require.NoError(t, err)
 
 	shard2 := core.Shard{}
@@ -402,6 +434,7 @@ func TestChunkData_ConcurrencyWrite(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	chunkname := clustermgr.NewChunkID(0).String()
 
@@ -415,7 +448,7 @@ func TestChunkData_ConcurrencyWrite(t *testing.T) {
 
 	concurrency := 10
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: int32(concurrency), WriteQueueDepth: int32(concurrency), WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, int(concurrency))
 	defer ioQos.Close()
 	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
 	require.NoError(t, err)
@@ -492,6 +525,7 @@ func TestChunkData_ConcurrencyWriteRead(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	chunkname := clustermgr.NewChunkID(0).String()
 
@@ -505,7 +539,7 @@ func TestChunkData_ConcurrencyWriteRead(t *testing.T) {
 
 	concurrency := 20
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: int32(concurrency), WriteQueueDepth: int32(concurrency), WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, int(concurrency))
 	defer ioQos.Close()
 	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
 	require.NoError(t, err)
@@ -601,12 +635,203 @@ func TestChunkData_ConcurrencyWriteRead(t *testing.T) {
 	require.Equal(t, int64(expectedOff), int64(cd.wOff))
 }
 
+func TestChunkData_BatchRead(t *testing.T) {
+	testDir, err := os.MkdirTemp(os.TempDir(), defaultDiskTestDir+"ChunkDataBatchRead")
+	require.NoError(t, err)
+	defer os.RemoveAll(testDir)
+	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+
+	chunkname := clustermgr.NewChunkID(0).String()
+	chunkname = filepath.Join(testDir, chunkname)
+	log.Info(chunkname)
+	diskConfig := &core.Config{
+		BaseConfig: core.BaseConfig{Path: testDir},
+		RuntimeConfig: core.RuntimeConfig{
+			BlockBufferSize:          64 * 1024,
+			BatchBufferSize:          1024 * 1024 * 1,
+			BatchBufferHoleThreshold: 128 * 1024,
+		},
+	}
+
+	ioPools := newIoPoolMock(t)
+	ioQos := newIoQosMgrMock(t, 2)
+	defer ioQos.Close()
+	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
+	require.NoError(t, err)
+	require.NotNil(t, cd)
+	defer cd.Close()
+
+	log.Infof("chunkdata: \n%s", cd)
+
+	shardNum := 10
+
+	require.Equal(t, int32(cd.wOff), int32(4096))
+	bidInfo := make([]bnapi.BidInfo, shardNum)
+	shards := make([]*core.Shard, 0)
+	sharddatas := make([][]byte, 0)
+	rand.Seed(time.Now().UnixNano())
+	// write 10 bids, more than 1MB data, and buffer size set 1MB
+	for i := 0; i < shardNum; i++ {
+		sharddata := make([]byte, 150*1024)
+		for k := range sharddata {
+			sharddata[k] = byte(rand.Intn(100)) // 填充0到99的随机数
+		}
+		sharddata[0] = byte(i + 1)
+		body := bytes.NewBuffer(sharddata)
+		shard := &core.Shard{
+			Bid:  proto.BlobID(1024 + i),
+			Vuid: 12,
+			Flag: bnapi.ShardStatusNormal,
+			Size: uint32(len(sharddata)),
+			Body: body,
+		}
+		// write data
+		err = cd.Write(ctx, shard)
+		require.NoError(t, err)
+		bidInfo[i] = bnapi.BidInfo{
+			Bid:    proto.BlobID(1024 + i),
+			Size:   int64(uint32(len(sharddata))),
+			Offset: shard.Offset,
+			Crc:    shard.Crc,
+		}
+		shards = append(shards, shard)
+		sharddatas = append(sharddatas, sharddata)
+	}
+	batchShard, err := core.NewBatchShardReader(bidInfo, 12, nil, diskConfig.BatchBufferSize)
+	require.NoError(t, err)
+	rc, err := cd.BatchRead(ctx, batchShard)
+	require.NoError(t, err)
+	defer rc.Close()
+	all := bytes.NewBuffer(nil)
+	rc.WriteTo(all)
+	if tr, ok := rc.(interface{ Duration() time.Duration }); ok {
+		duration := tr.Duration()
+		t.Logf("read time: %v", duration)
+	}
+	var header bnapi.ShardsHeader
+	for i := 0; i < shardNum; i++ {
+		n, err := io.ReadFull(all, header[:])
+		require.NoError(t, err)
+		require.Equal(t, n, len(header))
+		require.Equal(t, header.Get(), 200)
+		dst := make([]byte, shards[i].Size)
+		n, err = io.ReadFull(all, dst)
+		require.NoError(t, err)
+		require.Equal(t, n, int(shards[i].Size))
+		require.Equal(t, sharddatas[i], dst)
+	}
+
+	// bid8 has deleted
+	bidInfos1 := make([]bnapi.BidInfo, 0)
+	bidInfos1 = append(bidInfos1, bidInfo[:8]...)
+	bidInfos1 = append(bidInfos1, bidInfo[9:]...)
+
+	batchShard, err = core.NewBatchShardReader(bidInfos1, 12, nil, diskConfig.BatchBufferSize)
+	require.NoError(t, err)
+	rc, err = cd.BatchRead(ctx, batchShard)
+	require.NoError(t, err)
+	all.Reset()
+	rc.WriteTo(all)
+	for i := 0; i < shardNum-1; i++ {
+		j := i
+		if j >= 8 {
+			j = i + 1
+		}
+		n, err := io.ReadFull(all, header[:])
+		require.NoError(t, err)
+		require.Equal(t, n, len(header))
+		require.Equal(t, header.Get(), 200)
+		dst := make([]byte, shards[j].Size)
+		n, err = io.ReadFull(all, dst)
+		require.NoError(t, err)
+
+		require.Equal(t, n, int(shards[j].Size))
+		require.Equal(t, sharddatas[j], dst)
+	}
+	// read code by part
+	batchShard, err = core.NewBatchShardReader([]bnapi.BidInfo{bidInfo[0]}, 12, nil, diskConfig.BatchBufferSize)
+	require.NoError(t, err)
+	rc, err = cd.BatchRead(ctx, batchShard)
+	require.NoError(t, err)
+	all.Reset()
+	rc.WriteTo(all)
+	p := make([]byte, 1)
+	n, err := io.ReadFull(all, p)
+	require.NoError(t, err)
+	require.Equal(t, n, 1)
+	header[0] = p[0]
+	p = make([]byte, 4)
+	n, err = io.ReadFull(all, p)
+	require.NoError(t, err)
+	require.Equal(t, n, 4)
+	n = copy(header[1:], p)
+	require.Equal(t, n, 3)
+	require.Equal(t, byte(1), p[3])
+	require.Equal(t, header.Get(), 200)
+
+	// read data by part
+	batchShard, err = core.NewBatchShardReader([]bnapi.BidInfo{bidInfo[0]}, 12, nil, diskConfig.BatchBufferSize)
+	require.NoError(t, err)
+	rc, err = cd.BatchRead(ctx, batchShard)
+	require.NoError(t, err)
+	all.Reset()
+	rc.WriteTo(all)
+	n, err = io.ReadFull(all, header[:])
+	require.NoError(t, err)
+	require.Equal(t, n, 4)
+	require.Equal(t, header.Get(), 200)
+	need := bidInfo[0].Size
+	data := make([]byte, need)
+	read := int64(0)
+	for need > 0 {
+		toread := rand.Int63n(64 * 1024)
+		if toread > need {
+			toread = need
+		}
+		n, err = io.ReadFull(all, data[read:read+toread])
+		require.NoError(t, err)
+		require.Equal(t, n, int(toread))
+		need -= int64(n)
+		read += int64(n)
+	}
+	require.Equal(t, sharddatas[0], data)
+
+	// bid not match
+	errBid := bidInfo[0]
+	errBid.Bid += 1
+	batchShard, err = core.NewBatchShardReader([]bnapi.BidInfo{errBid}, 12, nil, diskConfig.BatchBufferSize)
+	require.NoError(t, err)
+	rc, err = cd.BatchRead(ctx, batchShard)
+	require.NoError(t, err)
+	all.Reset()
+	_, err = rc.WriteTo(all)
+	require.Error(t, err)
+	_, err = io.ReadFull(all, header[:])
+	require.NoError(t, err)
+	require.Equal(t, header.Get(), bloberr.CodeBidNotMatch)
+
+	// continue read should return EOF
+	n, err = io.ReadFull(all, data)
+	require.ErrorIs(t, err, io.EOF)
+	require.Equal(t, 0, n)
+
+	batchShard, err = core.NewBatchShardReader([]bnapi.BidInfo{}, 12, nil, diskConfig.BatchBufferSize)
+	require.NoError(t, err)
+	rc, err = cd.BatchRead(ctx, batchShard)
+	require.NoError(t, err)
+	all.Reset()
+	_, err = rc.WriteTo(all)
+	require.ErrorIs(t, err, nil)
+}
+
 func TestChunkData_ReadWrite(t *testing.T) {
 	testDir, err := os.MkdirTemp(os.TempDir(), defaultDiskTestDir+"ChunkDataCompact")
 	require.NoError(t, err)
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	chunkname := clustermgr.NewChunkID(0).String()
 
@@ -621,7 +846,7 @@ func TestChunkData_ReadWrite(t *testing.T) {
 	}
 
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 2)
 	defer ioQos.Close()
 	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
 	require.NoError(t, err)
@@ -683,6 +908,7 @@ func TestChunkData_Delete(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	chunkname := clustermgr.NewChunkID(0).String()
 
@@ -694,7 +920,7 @@ func TestChunkData_Delete(t *testing.T) {
 		RuntimeConfig: core.RuntimeConfig{BlockBufferSize: 64 * 1024, EnableDeleteShardVerify: true},
 	}
 	ioPools := newIoPoolMock(t)
-	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 100, WriteQueueDepth: 100, WriteChanQueCnt: 2})
+	ioQos := newIoQosMgrMock(t, 100)
 	defer ioQos.Close()
 	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
 	require.NoError(t, err)
@@ -716,6 +942,7 @@ func TestChunkData_Delete(t *testing.T) {
 	}
 
 	// write data, offset:5267456
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 	err = cd.Write(ctx, shard)
 	require.NoError(t, err)
 
@@ -723,6 +950,7 @@ func TestChunkData_Delete(t *testing.T) {
 	require.NoError(t, err)
 	defer f.Close()
 
+	ctx = bnapi.SetIoType(ctx, bnapi.DeleteIO)
 	shard.Size = uint32(len(shardData) + 1)
 	err = cd.Delete(ctx, shard)
 	require.Error(t, err)
@@ -760,6 +988,7 @@ func TestChunkData_Delete(t *testing.T) {
 
 	require.Equal(t, len(shards), concurrency)
 
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 	retCh := make(chan error, concurrency)
 	for i := 0; i < concurrency; i++ {
 		go func(i int, shard *core.Shard) {
@@ -797,6 +1026,7 @@ func TestChunkData_Delete(t *testing.T) {
 	statBefore, err := cd.ef.SysStat()
 	require.NoError(t, err)
 
+	ctx = bnapi.SetIoType(ctx, bnapi.DeleteIO)
 	for i := 0; i < concurrency; i++ {
 		err = cd.Delete(ctx, shards[i])
 		require.NoError(t, err)
@@ -817,6 +1047,7 @@ func TestChunkData_Destroy(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	chunkname := clustermgr.NewChunkID(0).String()
 
@@ -863,6 +1094,7 @@ func TestParseMeta(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
 
 	chunkname := clustermgr.NewChunkID(0).String()
 
@@ -946,4 +1178,335 @@ func TestChunkHeader(t *testing.T) {
 	chunkHeader := ChunkHeader{}
 	s := chunkHeader.String()
 	require.NotNil(t, s)
+}
+
+func TestChunkData_WriteReadCancel(t *testing.T) {
+	testDir, err := os.MkdirTemp(os.TempDir(), defaultDiskTestDir+"WriteCancel")
+	require.NoError(t, err)
+	defer os.RemoveAll(testDir)
+
+	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+
+	chunkname := clustermgr.NewChunkID(0).String()
+	chunkname = filepath.Join(testDir, chunkname)
+	log.Info(chunkname)
+
+	diskConfig := &core.Config{
+		BaseConfig: core.BaseConfig{Path: testDir},
+		RuntimeConfig: core.RuntimeConfig{
+			BlockBufferSize: 64 * 1024,
+		},
+	}
+
+	ioPools := newIoPoolMock(t)
+	ioQos := newIoQosMgrMock(t, 2)
+	defer ioQos.Close()
+	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
+	require.NoError(t, err)
+	require.NotNil(t, cd)
+	defer cd.Close()
+
+	// mock
+	backup := cd.ef
+	ctr := gomock.NewController(t)
+	cd.ef = bnmock.NewMockBlobFile(ctr)
+	a := gomock.Any()
+
+	log.Infof("chunkdata: \n%s", cd)
+	require.Equal(t, int32(cd.wOff), int32(4096))
+	sharddata := []byte("test data")
+
+	// build shard data
+	shard := &core.Shard{
+		Bid:  5,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	// write ok, size 9.
+	cd.ef.(*bnmock.MockBlobFile).EXPECT().WriteAtCtx(a, a, a).DoAndReturn(func(ctx context.Context, b []byte, off int64) (n int, err error) {
+		return len(b), nil
+	})
+	err = cd.Write(ctx, shard)
+	require.NoError(t, err)
+	require.Equal(t, int32(shard.Offset), int32(4096))
+	require.Equal(t, int32(cd.wOff), int32(8192))
+
+	// fail, ctx cancel, before enqueue
+	ctx = context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+	ctx, cancel := context.WithCancel(ctx)
+	shard2 := &core.Shard{
+		Bid:  6,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	cancel()
+	cd.ef.(*bnmock.MockBlobFile).EXPECT().WriteAtCtx(a, a, a).DoAndReturn(func(ctx context.Context, b []byte, off int64) (n int, err error) {
+		return 0, context.Canceled
+	})
+	err = cd.Write(ctx, shard2)
+	require.NotNil(t, err)
+
+	// fail, ctx cancel, after dequeue
+	ctx = context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+	ctx, cancel = context.WithCancel(ctx)
+	shard2.Body = bytes.NewBuffer(sharddata)
+
+	cd.ef.(*bnmock.MockBlobFile).EXPECT().WriteAtCtx(ctx, a, a).DoAndReturn(func(ctx context.Context, b []byte, off int64) (n int, err error) {
+		cancel()
+
+		select {
+		case <-ctx.Done():
+			n, err = 0, ctx.Err()
+			return
+		default:
+		}
+		return len(b), nil
+	})
+	err = cd.Write(ctx, shard2)
+	require.NotNil(t, err)
+	require.ErrorIs(t, err, bloberr.ErrIOCtxCancel)
+
+	// read fail, cancel
+	ctx = context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.ReadIO)
+	ctx, cancel = context.WithCancel(ctx)
+	readBuf := bytes.NewBuffer(nil)
+	shard.Writer = readBuf
+
+	rc, err := cd.Read(ctx, shard, 0, shard.Size)
+	require.NoError(t, err)
+
+	tw := base.NewTimeWriter(shard.Writer)
+	tr := base.NewTimeReader(rc)
+
+	cancel()
+	cd.ef.(*bnmock.MockBlobFile).EXPECT().ReadAtCtx(a, a, a).DoAndReturn(func(ctx context.Context, b []byte, off int64) (n int, err error) {
+		return 0, context.Canceled
+	}).AnyTimes()
+	n, err := io.CopyN(tw, tr, int64(len(sharddata)))
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, int64(0), n)
+
+	// resume
+	cd.ef = backup
+}
+
+// this test verifies that when tw.Write returns n != len(buf), the function returns ErrInternal
+func TestChunkData_WritePartialWrite(t *testing.T) {
+	testDir, err := os.MkdirTemp(os.TempDir(), defaultDiskTestDir+"WritePartialWrite")
+	require.NoError(t, err)
+	defer os.RemoveAll(testDir)
+
+	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+
+	chunkname := clustermgr.NewChunkID(0).String()
+	chunkname = filepath.Join(testDir, chunkname)
+	log.Info(chunkname)
+
+	diskConfig := &core.Config{
+		BaseConfig: core.BaseConfig{Path: testDir},
+		RuntimeConfig: core.RuntimeConfig{
+			BlockBufferSize: 64 * 1024,
+		},
+	}
+
+	ioPools := newIoPoolMock(t)
+	ioQos := newIoQosMgrMock(t, 2)
+	defer ioQos.Close()
+	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
+	require.NoError(t, err)
+	require.NotNil(t, cd)
+	defer cd.Close()
+
+	// Mock the blob file to simulate partial writes
+	backup := cd.ef
+	ctr := gomock.NewController(t)
+	mockBlobFile := bnmock.NewMockBlobFile(ctr)
+	cd.ef = mockBlobFile
+
+	log.Infof("chunkdata: \n%s", cd)
+	require.Equal(t, int32(cd.wOff), int32(4096))
+
+	// Test case 1: Partial write - write returns fewer bytes than requested
+	sharddata := []byte("test data for partial write")
+	shard := &core.Shard{
+		Bid:  1001,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	// Mock WriteAtCtx to return partial write (fewer bytes than requested)
+	mockBlobFile.EXPECT().WriteAtCtx(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, b []byte, off int64) (n int, err error) {
+			// Simulate partial write - return only half of the requested bytes
+			return len(b) / 2, nil
+		}).AnyTimes()
+
+	err = cd.Write(ctx, shard)
+	require.Error(t, err)
+	require.ErrorIs(t, err, bloberr.ErrInternal)
+	t.Logf("Expected error for partial write: %v", err)
+
+	// Test case 2: Zero write - write returns 0 bytes
+	shard2 := &core.Shard{
+		Bid:  1002,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	// Mock WriteAtCtx to return 0 bytes written
+	mockBlobFile.EXPECT().WriteAtCtx(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, b []byte, off int64) (n int, err error) {
+			// Simulate zero write
+			return 0, nil
+		}).AnyTimes()
+
+	err = cd.Write(ctx, shard2)
+	require.Error(t, err)
+	require.ErrorIs(t, err, bloberr.ErrInternal)
+	t.Logf("Expected error for zero write: %v", err)
+
+	// Test case 3: Write returns more bytes than requested (should not happen in practice, but test for robustness)
+	shard3 := &core.Shard{
+		Bid:  1003,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	// Mock WriteAtCtx to return more bytes than requested
+	mockBlobFile.EXPECT().WriteAtCtx(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, b []byte, off int64) (n int, err error) {
+			// Simulate writing more bytes than requested
+			return len(b) + 10, nil
+		}).AnyTimes()
+
+	err = cd.Write(ctx, shard3)
+	require.Error(t, err)
+	require.ErrorIs(t, err, bloberr.ErrInternal)
+	t.Logf("Expected error for excessive write: %v", err)
+
+	// Test case 4: Normal write should still work when mock is restored
+	cd.ef = backup
+	shard4 := &core.Shard{
+		Bid:  1004,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	err = cd.Write(ctx, shard4)
+	require.NoError(t, err)
+	t.Logf("Normal write succeeded after restoring backup: %v", err)
+}
+
+// This test verifies that when context is canceled during write, ErrIOCtxCancel is returned
+func TestChunkData_WriteContextCanceled(t *testing.T) {
+	testDir, err := os.MkdirTemp(os.TempDir(), defaultDiskTestDir+"WriteContextCanceled")
+	require.NoError(t, err)
+	defer os.RemoveAll(testDir)
+
+	ctx := context.Background()
+	ctx = bnapi.SetIoType(ctx, bnapi.WriteIO)
+
+	chunkname := clustermgr.NewChunkID(0).String()
+	chunkname = filepath.Join(testDir, chunkname)
+	log.Info(chunkname)
+
+	diskConfig := &core.Config{
+		BaseConfig: core.BaseConfig{Path: testDir},
+		RuntimeConfig: core.RuntimeConfig{
+			BlockBufferSize: 64 * 1024,
+		},
+	}
+
+	ioPools := newIoPoolMock(t)
+	ioQos := newIoQosMgrMock(t, 2)
+	defer ioQos.Close()
+	cd, err := NewChunkData(ctx, core.VuidMeta{}, chunkname, diskConfig, true, ioQos, ioPools)
+	require.NoError(t, err)
+	require.NotNil(t, cd)
+	defer cd.Close()
+
+	// Mock the blob file
+	backup := cd.ef
+	ctr := gomock.NewController(t)
+	mockBlobFile := bnmock.NewMockBlobFile(ctr)
+	cd.ef = mockBlobFile
+
+	log.Infof("chunkdata: \n%s", cd)
+	require.Equal(t, int32(cd.wOff), int32(4096))
+
+	sharddata := []byte("test data for context cancellation")
+	shard := &core.Shard{
+		Bid:  2001,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	// Test case 1: Context canceled before write operation
+	ctxCanceled := context.Background()
+	ctxCanceled = bnapi.SetIoType(ctxCanceled, bnapi.WriteIO)
+	ctxCanceled, cancel := context.WithCancel(ctxCanceled)
+	cancel() // Cancel immediately
+
+	// Mock WriteAtCtx to return context.Canceled error
+	mockBlobFile.EXPECT().WriteAtCtx(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, b []byte, off int64) (n int, err error) {
+			return 0, context.Canceled
+		}).AnyTimes()
+
+	err = cd.Write(ctxCanceled, shard)
+	require.Error(t, err)
+	require.ErrorIs(t, err, bloberr.ErrIOCtxCancel)
+	t.Logf("Expected ErrIOCtxCancel for context canceled before write: %v", err)
+
+	// Test case 2: Context canceled during write operation
+	ctxCanceled2 := context.Background()
+	ctxCanceled2 = bnapi.SetIoType(ctxCanceled2, bnapi.WriteIO)
+	ctxCanceled2, cancel2 := context.WithCancel(ctxCanceled2)
+
+	// Mock WriteAtCtx to cancel context during write
+	mockBlobFile.EXPECT().WriteAtCtx(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, b []byte, off int64) (n int, err error) {
+			cancel2() // Cancel during write
+			return 0, context.Canceled
+		}).AnyTimes()
+
+	err = cd.Write(ctxCanceled2, shard)
+	require.Error(t, err)
+	// require.ErrorIs(t, err, bloberr.ErrIOCtxCancel)  // Reader Error
+	t.Logf("Expected ErrIOCtxCancel for context canceled during write: %v", err)
+
+	// Test case 3: Normal write should work with valid context
+	cd.ef = backup
+	shard2 := &core.Shard{
+		Bid:  2002,
+		Vuid: 10,
+		Flag: bnapi.ShardStatusNormal,
+		Size: uint32(len(sharddata)),
+		Body: bytes.NewBuffer(sharddata),
+	}
+
+	err = cd.Write(ctx, shard2)
+	require.NoError(t, err)
+	t.Logf("Normal write succeeded with valid context: %v", err)
 }

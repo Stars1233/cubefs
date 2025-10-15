@@ -17,385 +17,375 @@ package qos
 import (
 	"context"
 	"io"
-	"math/rand"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
 	"golang.org/x/time/rate"
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
+	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/iostat"
+	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/closer"
-)
-
-type Qos interface {
-	ReaderAt(context.Context, bnapi.IOType, io.ReaderAt) io.ReaderAt
-	WriterAt(context.Context, bnapi.IOType, iostat.WriterAtCtx) iostat.WriterAtCtx
-	Writer(context.Context, bnapi.IOType, io.Writer) io.Writer
-	Reader(context.Context, bnapi.IOType, io.Reader) io.Reader
-	TryAllow(rwType IOTypeRW) bool
-	Release(rwType IOTypeRW)
-	TryAcquireIO(ctx context.Context, chunkId uint64, rwType IOTypeRW) bool
-	ReleaseIO(chunkId uint64, rwType IOTypeRW)
-	ResetQosLimit(Config)
-	GetConfig() Config
-	Close()
-}
-
-type (
-	IOTypeRW  int
-	LimitType int
+	"github.com/cubefs/cubefs/blobstore/util/limit"
+	"github.com/cubefs/cubefs/blobstore/util/limit/keycount"
 )
 
 const (
-	IOTypeRead = IOTypeRW(iota)
-	IOTypeWrite
-	IOTypeDel
-	IOTypeMax
-
-	MaxQueueDepth = 4096
-
-	percent = 100
+	limitConcurrencyKey = 0xffffffff
+	emaMultiple         = 1000
+	reasonBusy          = "busy"
+	reasonIdle          = "idle"
+	reasonOriginal      = "original"
 )
 
-const (
-	LimitTypeWrite = LimitType(iota) // bnapi.NormalIO
-	LimitTypeBack                    // bnapi.BackgroundIO
-	LimitTypeRead
-	LimitTypeMax
-)
-
-type IoQueueQos struct {
-	maxWaitCnt   []int32         // const, max total wait IO count, per disk. different between read and write
-	ioCnt        []int32         // current total IO count, per disk.
-	bpsLimiters  []*rate.Limiter // limit bandwidth
-	readDiscard  *IoQosDiscard
-	writeDiscard []*IoQosDiscard // discard some low level IO
-	conf         Config
-	closer.Closer
+// QosAPI defines the interface for QoS control operations
+type QosAPI interface {
+	ReaderAt(context.Context, io.ReaderAt) io.ReaderAt
+	WriterAt(context.Context, io.WriterAt) io.WriterAt
+	Writer(context.Context, io.Writer) io.Writer
+	Reader(context.Context, io.Reader) io.Reader
+	Acquire() error
+	Release()
+	AcquireBid(uint64) error
+	ReleaseBid(uint64)
 }
 
-func NewIoQueueQos(conf Config) (Qos, error) {
-	qos := &IoQueueQos{
-		ioCnt:        make([]int32, IOTypeMax), // idx 0:read, 1:write, 2:del
-		maxWaitCnt:   []int32{conf.ReadQueueDepth, conf.WriteQueueDepth * conf.WriteChanQueCnt, conf.DeleteQueueDepth},
-		readDiscard:  newIoQosDiscard(conf.ReadQueueDepth, conf.ReadDiscard),
-		writeDiscard: newWriteIoQosLimit(conf.WriteQueueDepth, conf.WriteChanQueCnt, conf.WriteDiscard),
-		conf:         conf,
-		Closer:       closer.New(),
-	}
-	qos.initBpsLimiters()
-
-	return qos, nil
+// QosMgr manages QoS for different IO types
+type QosMgr struct {
+	qos    map[bnapi.IOType]*queueQos
+	conf   Config
+	lck    sync.Mutex // lock conf, for hot update config
+	closed closer.Closer
 }
 
-func (qos *IoQueueQos) ReaderAt(ctx context.Context, ioType bnapi.IOType, reader io.ReaderAt) io.ReaderAt {
-	r := reader
-	if ios := qos.getIostat(ioType); ios != nil {
-		r = ios.ReaderAt(reader)
+// NewQosMgr creates a QoS manager with specified configuration(per disk)
+func NewQosMgr(conf Config) (*QosMgr, error) {
+	if err := FixQosConfigOnInit(&conf); err != nil {
+		return nil, err
+	}
+	closed := closer.New()
+
+	mgr := &QosMgr{
+		conf:   conf,
+		closed: closed,
+	}
+	mgr.qos = map[bnapi.IOType]*queueQos{
+		bnapi.ReadIO:       newQueueQos(bnapi.ReadIO, conf, closed, mgr),
+		bnapi.WriteIO:      newQueueQos(bnapi.WriteIO, conf, closed, mgr),
+		bnapi.DeleteIO:     newQueueQos(bnapi.DeleteIO, conf, closed, mgr),
+		bnapi.BackgroundIO: newQueueQos(bnapi.BackgroundIO, conf, closed, mgr),
 	}
 
-	// if lmt is null, dont limit io rate
-	idx := LimitTypeRead
-	if ioType == bnapi.BackgroundIO {
-		idx = LimitTypeBack
-	}
-	if lmt := qos.getBpsLimiter(idx); lmt != nil {
-		r = &rateLimiter{
-			ctx:        ctx,
-			readerAt:   r,
-			bpsLimiter: lmt,
-		}
-	}
-	return r
+	return mgr, nil
 }
 
-func (qos *IoQueueQos) WriterAt(ctx context.Context, ioType bnapi.IOType, writer iostat.WriterAtCtx) iostat.WriterAtCtx {
-	w := writer
-	if ios := qos.getIostat(ioType); ios != nil {
-		w = ios.WriterAtCtx(writer)
-	}
-
-	if lmt := qos.getBpsLimiter(LimitType(ioType)); lmt != nil {
-		w = &rateLimiter{
-			ctx:        ctx,
-			wAtCtx:     w,
-			bpsLimiter: lmt,
-		}
-	}
-	return w
+// Close gracefully shuts down the QoS manager
+func (mgr *QosMgr) Close() {
+	mgr.closed.Close()
 }
 
-func (qos *IoQueueQos) Writer(ctx context.Context, ioType bnapi.IOType, writer io.Writer) io.Writer {
-	w := writer
-	if ios := qos.getIostat(ioType); ios != nil {
-		w = ios.Writer(writer)
-	}
-
-	if lmt := qos.getBpsLimiter(LimitType(ioType)); lmt != nil {
-		w = &rateLimiter{
-			ctx:        ctx,
-			writer:     w,
-			bpsLimiter: lmt,
-		}
-	}
-	return w
+// GetQueueQos returns the queue qos for the given io type(which is the io type of the context).
+func (mgr *QosMgr) GetQueueQos(ctx context.Context) (QosAPI, bool) {
+	ret, ok := mgr.qos[bnapi.GetIoType(ctx)]
+	return ret, ok
 }
 
-func (qos *IoQueueQos) Reader(ctx context.Context, ioType bnapi.IOType, reader io.Reader) io.Reader {
-	r := reader
-	if ios := qos.getIostat(ioType); ios != nil {
-		r = ios.Reader(reader)
+// GetConfig returns the config of the qos manager.
+func (mgr *QosMgr) GetConfig() FlowConfig {
+	allConf := FlowConfig{
+		CommonDiskConfig: mgr.getDiskConfig(),
+		Level:            make(LevelConfigMap),
 	}
 
-	idx := LimitTypeRead
-	if ioType == bnapi.BackgroundIO {
-		idx = LimitTypeBack
+	for ioType, q := range mgr.qos {
+		allConf.Level[ioType.String()] = q.getLevelConf()
 	}
-	if lmt := qos.getBpsLimiter(idx); lmt != nil {
-		r = &rateLimiter{
-			ctx:        ctx,
-			reader:     r,
-			bpsLimiter: lmt,
-		}
-	}
-	return r
+
+	return allConf
 }
 
-// Allow whether beyond max wait num
-func (qos *IoQueueQos) TryAllow(rwType IOTypeRW) bool {
-	if atomic.AddInt32(&qos.ioCnt[rwType], 1) > atomic.LoadInt32(&qos.maxWaitCnt[rwType]) {
-		atomic.AddInt32(&qos.ioCnt[rwType], -1)
+// ResetDiskConfig updates QosMgr config and level common disk limits based on new configuration
+func (mgr *QosMgr) ResetDiskConfig(diskConf CommonDiskConfig) {
+	mgr.setDiskConfig(diskConf)
+}
+
+// ResetLevelConfig updates QosMgr config and level flow limits configuration
+func (mgr *QosMgr) ResetLevelConfig(level bnapi.IOType, levelConf LevelFlowConfig) bool {
+	levelQos, exist := mgr.qos[level]
+	if !exist {
 		return false
 	}
+
+	levelQos.resetLevelLimit(levelConf)
 	return true
 }
 
-func (qos *IoQueueQos) Release(rwType IOTypeRW) {
-	atomic.AddInt32(&qos.ioCnt[rwType], -1)
+func (mgr *QosMgr) setDiskConfig(diskConf CommonDiskConfig) {
+	mgr.lck.Lock()
+	defer mgr.lck.Unlock()
+	mgr.conf.CommonDiskConfig.resetDisk(diskConf)
 }
 
-// TryAcquireIO is just simply counts, and determines if you can operate IO. return true means you can operate IO.
-// 1.If the total IO is less than the queue depth, high-priority IO can be added to the queue; otherwise, they are discarded all
-// 2.If the low-priority IO less than half of the queue depth, it can be added to the queue; otherwise, they are discarded some
-func (qos *IoQueueQos) TryAcquireIO(ctx context.Context, chunkId uint64, rwType IOTypeRW) bool {
-	// judge whether the number exceeds the maximum(queue depth)
-	if !qos.TryAllow(rwType) {
-		return false
+func (mgr *QosMgr) getDiskConfig() CommonDiskConfig {
+	mgr.lck.Lock()
+	defer mgr.lck.Unlock()
+	return mgr.conf.CommonDiskConfig
+}
+
+type diskConfigGetter interface {
+	getDiskConfig() CommonDiskConfig
+}
+
+// queueQos limit disk bandwidth rate, iops rate and iops total rate, dynamic adjust rate
+type queueQos struct {
+	limitBps         *rate.Limiter           // Bandwidth rate limiter
+	limitBid         limit.ResettableLimiter // bid-based concurrency limiter
+	limitConcurrency limit.ResettableLimiter // Global concurrency limiter
+
+	ioStat      iostat.StatMgrAPI // IO statistics collector
+	diskStat    iostat.IOViewer   // Disk IO statistics viewer
+	diskBps     uint64            // Current disk bandwidth usage
+	diskIOps    uint64            // Current disk IOps usage
+	concurrence int64             // current level qos concurrency
+
+	getter diskConfigGetter
+	conf   *perIOQosConfig // QoS configuration per IO type
+	closed closer.Closer   // Resource cleanup handler
+}
+
+// newQueueQos creates a new QoS controller for specified IO type
+func newQueueQos(ioType bnapi.IOType, conf Config, closed closer.Closer, getter diskConfigGetter) *queueQos {
+	levelConf := &perIOQosConfig{
+		IOType:          ioType,
+		LevelFlowConfig: conf.Level[ioType.String()],
 	}
 
-	ret := false
-	switch rwType {
-	case IOTypeWrite:
-		idx := chunkId % uint64(len(qos.writeDiscard))
-		ret = qos.writeDiscard[idx].tryAcquire(ctx)
-	case IOTypeRead:
-		ret = qos.readDiscard.tryAcquire(ctx)
-	case IOTypeDel:
-		return true
+	q := &queueQos{
+		limitBps:         initLimiter(levelConf.MBPS),
+		limitBid:         keycount.New(int(levelConf.BidConcurrency)),
+		limitConcurrency: keycount.New(int(levelConf.Concurrency)),
+		ioStat:           conf.StatGetter.GetStatMgr(ioType),
+		diskStat:         conf.DiskViewer,
+		concurrence:      levelConf.Concurrency,
+		conf:             levelConf,
+		closed:           closed,
+		getter:           getter,
+	}
+
+	go q.loopUpdateCurrentStat(conf.UpdateIntervalMs)
+
+	return q
+}
+
+// ReaderAt wraps io.ReaderAt with QoS control
+func (q *queueQos) ReaderAt(ctx context.Context, reader io.ReaderAt) io.ReaderAt {
+	r := q.ioStat.ReaderAt(reader)
+	return &rateLimiter{ctx: ctx, readerAt: r, ctrl: q}
+}
+
+// Reader wraps io.Reader with QoS control
+func (q *queueQos) Reader(ctx context.Context, reader io.Reader) io.Reader {
+	r := q.ioStat.Reader(reader)
+	return &rateLimiter{ctx: ctx, reader: r, ctrl: q}
+}
+
+// WriterAt wraps io.WriterAt with QoS control
+func (q *queueQos) WriterAt(ctx context.Context, writer io.WriterAt) io.WriterAt {
+	w := q.ioStat.WriterAt(writer)
+	return &rateLimiter{ctx: ctx, writerAt: w, ctrl: q}
+}
+
+// Writer wraps io.Writer with QoS control. with io stat, qos limiter and disk stat
+func (q *queueQos) Writer(ctx context.Context, writer io.Writer) io.Writer {
+	w := q.ioStat.Writer(writer)
+	return &rateLimiter{ctx: ctx, writer: w, ctrl: q}
+}
+
+// Acquire attempts to acquire a concurrency slot
+func (q *queueQos) Acquire() (err error) {
+	if err = q.limitConcurrency.Acquire(limitConcurrencyKey); err != nil {
+		return errcode.ErrOverload
+	}
+	return nil
+}
+
+// Release frees a concurrency slot
+func (q *queueQos) Release() {
+	q.limitConcurrency.Release(limitConcurrencyKey)
+}
+
+// AcquireBid attempts to acquire a bid-specific concurrency slot
+func (q *queueQos) AcquireBid(bid uint64) (err error) {
+	if err = q.limitBid.Acquire(bid); err != nil {
+		return errcode.ErrOverload
+	}
+	return nil
+}
+
+// ReleaseBid frees a bid-specific concurrency slot
+func (q *queueQos) ReleaseBid(bid uint64) {
+	q.limitBid.Release(bid)
+}
+
+// ReserveN reserves n tokens from bandwidth limiter
+func (q *queueQos) ReserveN(t time.Time, n int) *rate.Reservation {
+	return q.limitBps.ReserveN(t, n)
+}
+
+// UpdateQosBpsLimiter dynamically adjusts bandwidth limits based on disk usage
+func (q *queueQos) UpdateQosBpsLimiter(ctx context.Context) {
+	span := trace.SpanFromContextSafe(ctx)
+	reason := ""
+
+	target, currentBps := 0, q.diskBps
+	lastBps := int64(q.limitBps.Limit())
+	diskConf := q.getter.getDiskConfig()
+	levelConf := q.getLevelConf()
+	diskConfBps := uint64(diskConf.DiskBandwidthMB * humanize.MiByte)
+	levelConfBps := levelConf.MBPS * humanize.MiByte
+	diskIdleBps := uint64(float64(diskConfBps) * diskConf.DiskIdleFactor)
+	levelIdleBps := int64(float64(levelConfBps) * levelConf.IdleFactor)
+
+	switch {
+	case currentBps >= diskConfBps && lastBps >= levelConfBps:
+		// reduce limit to level*busy when disk is busy
+		target = int(float64(levelConfBps) * levelConf.BusyFactor)
+		reason = reasonBusy
+	case currentBps < diskIdleBps && lastBps < levelIdleBps:
+		// increase limit to level*idle when disk is idle
+		target = int(levelIdleBps)
+		reason = reasonIdle
+	case currentBps < diskConfBps && lastBps < levelConfBps:
+		// reset to original limit when load normalizes
+		target = int(levelConfBps)
+		reason = reasonOriginal
 	default:
-		// only for lint: code will not execute here, it will panic at the function entrance
+		return
 	}
 
-	if !ret {
-		// only for tryAcquire of readDiscard or writeDiscard
-		qos.Release(rwType)
+	// The target is the same as last time, does not need to be modified
+	if lastBps == int64(target) {
+		return
 	}
-	return ret
+	resetLimiter(q.limitBps, target)
+	span.Infof("qos dynamical update Bps: reason:%s, diskID:%d, type:%s, %d -> %d",
+		reason, diskConf.DiskID, q.conf.IOType.String(), lastBps, target)
 }
 
-func (qos *IoQueueQos) ReleaseIO(chunkId uint64, rwType IOTypeRW) {
-	switch rwType {
-	case IOTypeWrite:
-		idx := chunkId % uint64(len(qos.writeDiscard))
-		qos.writeDiscard[idx].release()
-	case IOTypeRead:
-		qos.readDiscard.release()
+// UpdateQosConcurrency dynamically adjusts concurrency limits using EMA
+func (q *queueQos) UpdateQosConcurrency(ctx context.Context) {
+	span := trace.SpanFromContextSafe(ctx)
+	reason := ""
+
+	// The value of iops is very small, so the result of ema needs to be increased by 1000 multiple to be accurate
+	currIops := q.diskIOps / emaMultiple
+	diskConf := q.getter.getDiskConfig()
+	levelConf := q.getLevelConf()
+	target, original, lastCon := int64(0), levelConf.Concurrency, q.concurrence
+	diskIopsUsage := float64(currIops) / float64(diskConf.DiskIops)
+	idle := int64(float64(original) * levelConf.IdleFactor)
+
+	// Adjust concurrency based on disk utilization
+	switch {
+	case diskIopsUsage >= 1.0 && lastCon >= original:
+		// Reduce concurrency when disk is saturated
+		target = int64(float64(original) * levelConf.BusyFactor)
+		reason = reasonBusy
+	case diskIopsUsage < diskConf.DiskIdleFactor && lastCon < idle:
+		// Increase concurrency when disk is idle
+		target = idle
+		reason = reasonIdle
+	case diskIopsUsage < 1 && lastCon < original:
+		// Reset to original limit when load normalizes
+		target = original
+		reason = reasonOriginal
 	default:
-		// do nothing
+		return
 	}
-	qos.Release(rwType)
-}
 
-func (qos *IoQueueQos) Close() {
-	qos.readDiscard.Close()
-	for _, w := range qos.writeDiscard {
-		w.Close()
+	// The target is the same as last time, does not need to be modified
+	if lastCon == target {
+		return
 	}
-	qos.Closer.Close()
+	q.concurrence = target
+	q.limitConcurrency.Reset(int(target))
+	span.Infof("qos dynamical update concurrence: reason:%s, diskID:%d, type:%s, %d -> %d",
+		reason, diskConf.DiskID, q.conf.IOType.String(), lastCon, target)
 }
 
-func (qos *IoQueueQos) ResetQosLimit(conf Config) {
-	// reset mbps
-	qos.resetConfLimiter(qos.bpsLimiters[LimitTypeRead], conf.ReadMBPS, &qos.conf.ReadMBPS)
-	qos.resetConfLimiter(qos.bpsLimiters[LimitTypeWrite], conf.WriteMBPS, &qos.conf.WriteMBPS)
-	conf.BackgroundMBPS = fixBackgroundMBPS(conf.BackgroundMBPS, qos.conf.WriteMBPS, qos.conf.ReadMBPS)
-	qos.resetConfLimiter(qos.bpsLimiters[LimitTypeBack], conf.BackgroundMBPS, &qos.conf.BackgroundMBPS)
-
-	// reset discard
-	qos.resetReadDiscard(conf.ReadDiscard, &qos.conf.ReadDiscard)
-	qos.resetWriteDiscard(conf.WriteDiscard, &qos.conf.WriteDiscard)
-
-	// reset max wait count
-	qos.resetMaxWaitCnt(conf.ReadQueueDepth, IOTypeRead, &qos.conf.ReadQueueDepth)
-	qos.resetMaxWaitCnt(conf.WriteQueueDepth, IOTypeWrite, &qos.conf.WriteQueueDepth)
-	qos.resetMaxWaitCnt(conf.DeleteQueueDepth, IOTypeDel, &qos.conf.DeleteQueueDepth)
-}
-
-func (qos *IoQueueQos) GetConfig() Config {
-	return qos.conf
-}
-
-func (qos *IoQueueQos) GetBpsLimiter() []*rate.Limiter {
-	return qos.bpsLimiters
-}
-
-func (qos *IoQueueQos) resetConfLimiter(limiter *rate.Limiter, expect int64, confVal *int64) {
-	if expect > 0 {
-		qosVal := expect * humanize.MiByte
-		resetLimiter(limiter, int(qosVal))
-		atomic.StoreInt64(confVal, expect)
+// loopUpdateCurrentStat periodically updates IO statistics and adjusts QoS limits
+func (q *queueQos) loopUpdateCurrentStat(intervalMs int64) {
+	if q.diskStat == nil {
+		return
 	}
-}
 
-func (qos *IoQueueQos) resetReadDiscard(expect int32, confVal *int32) {
-	if expect > 0 {
-		atomic.StoreInt32(&qos.readDiscard.discardRatio, expect)
-		atomic.StoreInt32(confVal, expect)
+	ticker := time.NewTicker(time.Millisecond * time.Duration(intervalMs))
+	defer ticker.Stop()
+
+	updateFn := func() {
+		rStat, wStat := q.diskStat.ReadStat(), q.diskStat.WriteStat()
+
+		q.diskBps = ema(rStat.Bps+wStat.Bps, q.diskBps)
+		q.diskIOps = ema((rStat.Iops+wStat.Iops)*emaMultiple, q.diskIOps)
 	}
-}
 
-func (qos *IoQueueQos) resetWriteDiscard(expect int32, confVal *int32) {
-	if expect > 0 {
-		for _, d := range qos.writeDiscard {
-			atomic.StoreInt32(&d.discardRatio, expect)
-			atomic.StoreInt32(confVal, expect)
+	for {
+		_, ctx := trace.StartSpanFromContext(context.Background(), "Qos")
+		select {
+		case <-q.closed.Done():
+			return
+		case <-ticker.C:
+			updateFn()
+			q.UpdateQosBpsLimiter(ctx)
+			q.UpdateQosConcurrency(ctx)
 		}
 	}
 }
 
-func (qos *IoQueueQos) resetMaxWaitCnt(newCapacity int32, qosType IOTypeRW, confVal *int32) {
-	if newCapacity > 0 {
-		// fix config
-		if newCapacity > MaxQueueDepth {
-			newCapacity = MaxQueueDepth
-		}
-		// set
-		atomic.StoreInt32(&qos.maxWaitCnt[qosType], newCapacity)
-		atomic.StoreInt32(confVal, newCapacity)
+func (q *queueQos) getLevelConf() LevelFlowConfig {
+	q.conf.lck.Lock()
+	defer q.conf.lck.Unlock()
+	return q.conf.LevelFlowConfig
+}
+
+func (q *queueQos) resetLevelLimit(conf LevelFlowConfig) {
+	q.conf.resetLevel(conf)
+	if conf.BidConcurrency > 0 {
+		q.limitBid.Reset(int(conf.BidConcurrency))
+	}
+	if conf.Concurrency > 0 {
+		q.limitConcurrency.Reset(int(conf.Concurrency))
+	}
+	if conf.MBPS > 0 {
+		resetLimiter(q.limitBps, int(conf.MBPS*humanize.MiByte))
 	}
 }
 
-func (qos *IoQueueQos) initBpsLimiters() {
-	qos.bpsLimiters = make([]*rate.Limiter, LimitTypeMax)
-	qos.bpsLimiters[LimitTypeRead] = qos.initBpsLimiter(qos.conf.ReadMBPS * humanize.MiByte)
-	qos.bpsLimiters[LimitTypeWrite] = qos.initBpsLimiter(qos.conf.WriteMBPS * humanize.MiByte)
-	qos.bpsLimiters[LimitTypeBack] = qos.initBpsLimiter(qos.conf.BackgroundMBPS * humanize.MiByte)
-}
-
-func (qos *IoQueueQos) initBpsLimiter(bps int64) *rate.Limiter {
+// initLimiter creates a new rate limiter with specified bandwidth
+func initLimiter(bps int64) *rate.Limiter {
 	if bps > 0 {
+		bps *= humanize.MiByte
 		return rate.NewLimiter(rate.Limit(bps), 2*int(bps))
 	}
 	return nil
 }
 
-func (qos *IoQueueQos) getIostat(iot bnapi.IOType) (ios iostat.StatMgrAPI) {
-	if qos.conf.StatGetter != nil {
-		ios = qos.conf.StatGetter.GetStatMgr(iot)
-	}
-	return ios
-}
-
-func (qos *IoQueueQos) getBpsLimiter(tp LimitType) (l *rate.Limiter) {
-	return qos.bpsLimiters[tp]
-}
-
+// resetLimiter updates rate limiter with new capacity
 func resetLimiter(limiter *rate.Limiter, capacity int) {
 	limiter.SetLimit(rate.Limit(capacity))
 	limiter.SetBurst(2 * capacity)
 }
 
-type IoQosDiscard struct {
-	queueDepth   int32 // const, queue depth
-	currentCnt   int32 // current IO cnt in per queue, may be $currentCnt: [0, $queueDepth]
-	discardRatio int32
-	rand         *rand.Rand
-	closer.Closer
-}
-
-func newIoQosDiscard(depth int32, discard int32) *IoQosDiscard {
-	qos := &IoQosDiscard{
-		queueDepth:   depth,
-		discardRatio: discard,
-		rand:         rand.New(rand.NewSource(time.Now().UnixNano())),
-		Closer:       closer.New(),
+// EMA (Exponential Moving Average) calculation:
+// EMA = α * Current Value + (1-α) * Previous EMA Value
+// - α is tThe smoothing factor α (0 to 1):
+// - Higher α: more weight on recent data
+// - Lower α: smoother output, less sensitive to fluctuations
+func ema(curVal, lastVal uint64) uint64 {
+	if lastVal == 0 {
+		lastVal = curVal
 	}
-	return qos
-}
-
-// $depth: equal $queueDepth of io pool. The number of elements in the queue
-// $cnt: The number of chan queues, equal $chanCnt of write io pool
-func newWriteIoQosLimit(depth int32, cnt int32, discard int32) []*IoQosDiscard {
-	w := make([]*IoQosDiscard, cnt)
-	for i := range w {
-		w[i] = newIoQosDiscard(depth, discard)
-	}
-	return w
-}
-
-func (q *IoQosDiscard) tryAcquire(ctx context.Context) bool {
-	ioType := bnapi.GetIoType(ctx)
-	// high-level: more than full capacity,discard; else okay
-	if ioType.IsHighLevel() {
-		if !q.isMoreThanFull() {
-			q.incCount()
-			return true
-		}
-		return false
-	}
-	// more than full capacity, discard; not more than half, okay; otherwise, discard half IO
-	return q.allowLowLevel()
-}
-
-func (q *IoQosDiscard) incCount() {
-	atomic.AddInt32(&q.currentCnt, 1)
-}
-
-func (q *IoQosDiscard) decCount() {
-	atomic.AddInt32(&q.currentCnt, -1)
-}
-
-func (q *IoQosDiscard) isMoreThanFull() bool {
-	return atomic.LoadInt32(&q.currentCnt) >= q.queueDepth
-}
-
-func (q *IoQosDiscard) isMoreThanHalf() bool {
-	return atomic.LoadInt32(&q.currentCnt) >= (q.queueDepth / 2)
-}
-
-func (q *IoQosDiscard) allowLowLevel() bool {
-	// more than full capacity, discard
-	if q.isMoreThanFull() {
-		return false
-	}
-
-	// not exceeding half capacity, acceptable
-	if !q.isMoreThanHalf() {
-		q.incCount()
-		return true
-	}
-
-	// If your score(rand.Intn) is lower than the threshold, return false and discard this IO
-	if int32(q.rand.Intn(percent)) < atomic.LoadInt32(&q.discardRatio) {
-		return false
-	}
-
-	q.incCount()
-	return true
-}
-
-func (q *IoQosDiscard) release() {
-	q.decCount()
+	return (curVal*2 + lastVal*8) / 10
 }

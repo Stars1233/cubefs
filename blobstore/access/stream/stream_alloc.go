@@ -26,6 +26,7 @@ import (
 	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	"github.com/cubefs/cubefs/blobstore/util"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 	"github.com/cubefs/cubefs/blobstore/util/retry"
 )
@@ -112,7 +113,7 @@ func (h *Handler) allocFromAllocator(ctx context.Context,
 	args := proxy.AllocVolsArgs{
 		Fsize:    size,
 		CodeMode: codeMode,
-		BidCount: blobCount(size, blobSize),
+		BidCount: util.AlignedBlocks(size, uint64(blobSize)),
 	}
 
 	var allocRets []proxy.AllocRet
@@ -182,14 +183,14 @@ func (h *Handler) allocFromAllocator(ctx context.Context,
 		setCacheVidHost(clusterID, ret.Vid, allocHost)
 	}
 
-	blobN := blobCount(size, blobSize)
+	blobN := util.AlignedBlocks(size, uint64(blobSize))
 	blobs := make([]proto.Slice, 0, blobN)
 	for _, bidRet := range allocRets {
 		if blobN <= 0 {
 			break
 		}
 
-		count := minU64(blobN, uint64(bidRet.BidEnd)-uint64(bidRet.BidStart)+1)
+		count := util.Min(blobN, uint64(bidRet.BidEnd)-uint64(bidRet.BidStart)+1)
 		blobN -= count
 
 		blobs = append(blobs, proto.Slice{

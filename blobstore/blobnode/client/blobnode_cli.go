@@ -15,12 +15,14 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"strings"
 
 	api "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
+	"github.com/cubefs/cubefs/blobstore/common/crc32block"
 	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
@@ -32,15 +34,22 @@ var defaultFirstStartBid = proto.BlobID(0)
 // IBlobNode define the interface of blobnode used for worker
 type IBlobNode interface {
 	StatChunk(ctx context.Context, location proto.VunitLocation) (ci *ChunkInfo, err error)
-	StatShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID) (si *ShardInfo, err error)
+	StatShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, ioType api.IOType) (si *ShardInfo, err error)
 	ListShards(ctx context.Context, location proto.VunitLocation) (shards []*ShardInfo, err error)
 	GetShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, ioType api.IOType) (body io.ReadCloser, crc32 uint32, err error)
-	PutShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, size int64, body io.Reader, ioType api.IOType) (err error)
+	GetShards(ctx context.Context, location proto.VunitLocation, bids []api.BidInfo, ioType api.IOType) (getter api.ShardGetter, err error)
+	PutShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, size int64, data []byte, ioType api.IOType) (err error)
 }
 
 // BlobNodeClient blobnode client
 type BlobNodeClient struct {
-	cli api.StorageAPI
+	cli  api.StorageAPI
+	bCli api.StorageAPI
+}
+
+type Config struct {
+	api.Config
+	BatchReadTimeoutMs int64 `json:"batch_read_timeout_ms"`
 }
 
 const (
@@ -78,10 +87,19 @@ func (si *ShardInfo) NotExist() bool {
 	return si.Flag == ShardStatusNotExist
 }
 
+var nopDataSizes = make(map[int64]struct{})
+
+func NopdataSize(size int) {
+	nopDataSizes[int64(size)] = struct{}{}
+}
+
 // NewBlobNodeClient returns blobnode client
-func NewBlobNodeClient(conf *api.Config) IBlobNode {
+func NewBlobNodeClient(conf *Config) IBlobNode {
+	bc := conf.Config
+	bc.ClientTimeoutMs = conf.BatchReadTimeoutMs
 	return &BlobNodeClient{
-		cli: api.New(conf),
+		cli:  api.New(&conf.Config),
+		bCli: api.New(&bc),
 	}
 }
 
@@ -105,10 +123,10 @@ func (c *BlobNodeClient) GetShard(ctx context.Context, location proto.VunitLocat
 }
 
 // StatShard return shard stat
-func (c *BlobNodeClient) StatShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID) (si *ShardInfo, err error) {
+func (c *BlobNodeClient) StatShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, ioType api.IOType) (si *ShardInfo, err error) {
 	ctx = trace.NewContextFromContext(ctx)
 	span := trace.SpanFromContext(ctx).WithOperation("StatShard")
-	info, err := c.cli.StatShard(ctx, location.Host, &api.StatShardArgs{DiskID: location.DiskID, Vuid: location.Vuid, Bid: bid})
+	info, err := c.cli.StatShard(ctx, location.Host, &api.StatShardArgs{DiskID: location.DiskID, Vuid: location.Vuid, Bid: bid, Type: ioType})
 	if err != nil {
 		if errCode := rpc.DetectStatusCode(err); errCode == errcode.CodeBidNotFound {
 			span.Debugf("StatShard not found and set flag ShardStatusNotExist: location[%+v], bid[%d]", location, bid)
@@ -148,16 +166,31 @@ func (c *BlobNodeClient) ListShards(ctx context.Context, location proto.VunitLoc
 }
 
 // PutShard put data to shard
-func (c *BlobNodeClient) PutShard(ctx context.Context, location proto.VunitLocation, bid proto.BlobID, size int64, body io.Reader, ioType api.IOType) (err error) {
+func (c *BlobNodeClient) PutShard(ctx context.Context,
+	location proto.VunitLocation, bid proto.BlobID, size int64, data []byte, ioType api.IOType,
+) (err error) {
 	ctx = trace.NewContextFromContext(ctx)
 	span := trace.SpanFromContext(ctx).WithOperation("PutShard")
-	_, err = c.cli.PutShard(ctx, location.Host, &api.PutShardArgs{DiskID: location.DiskID, Vuid: location.Vuid, Bid: bid, Body: body, Size: size, Type: ioType})
+	args := &api.PutShardArgs{DiskID: location.DiskID, Vuid: location.Vuid, Bid: bid, Size: size, Type: ioType}
+	_, maybeNopData := nopDataSizes[size]
+	if maybeNopData && crc32block.IsZeroBuffer(data) {
+		args.NopData = true
+	} else {
+		args.Body = bytes.NewBuffer(data)
+	}
+	_, err = c.cli.PutShard(ctx, location.Host, args)
 	if err != nil {
-		span.Errorf("PutShard failed: location[%+v], bid[%d], code[%d], err[%+v]", location, bid, rpc.DetectStatusCode(err), err)
+		span.Errorf("location[%+v], bid[%d], code[%d], err[%+v]", location, bid, rpc.DetectStatusCode(err), err)
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "Timeout") || strings.Contains(errMsg, "timeout") {
 			err = errcode.ErrPutShardTimeout
 		}
 	}
 	return
+}
+
+// GetShards get batch shards
+func (c *BlobNodeClient) GetShards(ctx context.Context, location proto.VunitLocation, bids []api.BidInfo, ioType api.IOType) (getter api.ShardGetter, err error) {
+	ctx = trace.NewContextFromContext(ctx)
+	return c.bCli.GetShards(ctx, location.Host, &api.GetShardsArgs{DiskID: location.DiskID, Vuid: location.Vuid, Bids: bids, Type: ioType})
 }

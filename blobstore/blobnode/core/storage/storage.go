@@ -115,6 +115,10 @@ func (stg *storage) NewRangeReader(ctx context.Context, b *core.Shard, from, to 
 	return rc, nil
 }
 
+func (stg *storage) NewBatchReader(ctx context.Context, bs *core.BatchShard) (rc core.WriteToCloser, err error) {
+	return stg.data.BatchRead(ctx, bs)
+}
+
 func (stg *storage) MarkDelete(ctx context.Context, bid proto.BlobID) (err error) {
 	meta := stg.meta
 
@@ -160,9 +164,9 @@ func (stg *storage) Delete(ctx context.Context, bid proto.BlobID) (n int64, err 
 		return n, err
 	}
 
-	// data inline , skip
-	if shardMeta.Inline {
-		return int64(shardMeta.Size), nil
+	// inline and nopdata has no actual data in disk
+	if shardMeta.Inline || shardMeta.NopData {
+		return 0, nil
 	}
 
 	shard := &core.Shard{

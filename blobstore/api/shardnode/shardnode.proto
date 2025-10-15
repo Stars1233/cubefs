@@ -28,7 +28,7 @@ import "cubefs/blobstore/common/proto/blob.proto";
 import "cubefs/blobstore/common/raft/raft.proto";
 
 message Item {
-  bytes id = 1 [(gogoproto.customname) = "ID"];
+  string id = 1 [(gogoproto.customname) = "ID"];
   repeated Field fields = 2 [(gogoproto.nullable) = false];
 }
 
@@ -43,7 +43,6 @@ message ShardOpHeader {
   uint32 suid = 3  [(gogoproto.customname) = "Suid", (gogoproto.casttype) = "github.com/cubefs/cubefs/blobstore/common/proto.Suid"];
   uint64 spaceVersion = 4;
   uint64 route_version = 5 [(gogoproto.casttype) = "github.com/cubefs/cubefs/blobstore/common/proto.RouteVersion"];
-  repeated bytes shard_keys = 6;
 }
 
 message InsertItemArgs {
@@ -62,14 +61,14 @@ message UpdateItemRet {}
 
 message DeleteItemArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes id = 2 [(gogoproto.customname) = "ID"];
+  string id = 2 [(gogoproto.customname) = "ID"];
 }
 
 message DeleteItemRet {}
 
 message GetItemArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes id = 2 [(gogoproto.customname) = "ID"];
+  string id = 2 [(gogoproto.customname) = "ID"];
 }
 
 message GetItemRet {
@@ -78,14 +77,14 @@ message GetItemRet {
 
 message ListItemArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes prefix = 2;
-  bytes marker = 3;
+  string prefix = 2;
+  string marker = 3;
   uint64 count = 4;
 }
 
 message ListItemRet {
   repeated Item items = 1 [(gogoproto.nullable) = false];
-  bytes nextMarker = 2;
+  string nextMarker = 2;
 }
 
 message AddShardArgs {
@@ -127,7 +126,7 @@ message GetShardRet {
 
 message CreateBlobArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes name = 2;
+  string name = 2;
   uint32 codemode = 3 [(gogoproto.customname) = "CodeMode", (gogoproto.casttype) = "github.com/cubefs/cubefs/blobstore/common/codemode.CodeMode"];
   uint64 size = 4;
   uint32 slice_size = 5;
@@ -139,7 +138,7 @@ message CreateBlobRet {
 
 message GetBlobArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes name = 2;
+  string name = 2;
 }
 
 message GetBlobRet {
@@ -148,26 +147,26 @@ message GetBlobRet {
 
 message ListBlobArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes prefix = 2;
-  bytes marker = 3;
+  string prefix = 2;
+  string marker = 3;
   uint64 count = 4;
 }
 
 message ListBlobRet {
   repeated cubefs.blobstore.common.proto.Blob blobs = 1 [(gogoproto.nullable) = false];
-  bytes nextMarker = 2;
+  string nextMarker = 2;
 }
 
 message DeleteBlobArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes name = 2;
+  string name = 2;
 }
 
 message DeleteBlobRet {}
 
 message RetainBlobArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes name = 2;
+  string name = 2;
   uint64 lease = 3;
 }
 
@@ -176,7 +175,7 @@ message RetainBlobRet {}
 message SealBlobArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
   uint64 size = 2;
-  bytes name = 3;
+  string name = 3;
   repeated cubefs.blobstore.common.proto.Slice slices = 4 [(gogoproto.nullable) = false];
 }
 
@@ -184,7 +183,7 @@ message SealBlobRet {}
 
 message AllocSliceArgs {
   ShardOpHeader header = 1 [(gogoproto.nullable) = false];
-  bytes name = 2;
+  string name = 2;
   uint32 codemode = 3 [(gogoproto.customname) = "CodeMode", (gogoproto.casttype) = "github.com/cubefs/cubefs/blobstore/common/codemode.CodeMode"];
   uint64 size = 4;
   cubefs.blobstore.common.proto.Slice failed_slice = 5 [(gogoproto.nullable) = false];
@@ -254,4 +253,21 @@ message DBStatsRet {
   uint64 memtable_usage = 4;
   uint64 block_pinned_usage = 5;
   uint64 total_memory_usage = 6;
+}
+
+message DeleteBlobRawArgs {
+  ShardOpHeader header = 1 [(gogoproto.nullable) = false];
+  cubefs.blobstore.common.proto.Slice slice = 2 [(gogoproto.nullable) = false];
+}
+
+message DeleteBlobRawRet {}
+
+message DeleteBlobStatsArgs {}
+
+message DeleteBlobStatsRet {
+  bool enable = 1;
+  string success_per_min = 2;
+  string failed_per_min = 3;
+  uint64 total_err_cnt = 4;
+  repeated string err_stats = 5;
 }

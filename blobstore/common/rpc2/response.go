@@ -38,6 +38,8 @@ type ResponseWriter interface {
 	Flush() error
 	// io.Writer
 	io.ReaderFrom
+	// WriteBody writes body by application.
+	WriteBody(func(ChecksumBlock, *transport.Stream) (int64, error)) (int64, error)
 
 	AfterBody(func() error)
 }
@@ -78,10 +80,12 @@ type response struct {
 	hasWroteBody   bool
 
 	bodyEncoder *edBody
+	bodyAligned bool
 
 	remain    int // body remain
-	toWrite   int
-	toList    []io.Reader
+	nHeader   int
+	nBody     int
+	allReader multiReader // first Reader is Header
 	afterBody func() error
 }
 
@@ -140,8 +144,8 @@ func (resp *response) WriteHeader(status int, obj Marshaler) error {
 
 	var cell headerCell
 	cell.Set(resp.hdr.Size())
-	resp.toWrite += _headerCell + resp.hdr.Size()
-	resp.toList = append(resp.toList, codec2CellReader(cell, &resp.hdr))
+	resp.nHeader += _headerCell + resp.hdr.Size()
+	resp.allReader.Append(codec2CellReader(cell, &resp.hdr))
 	return nil
 }
 
@@ -162,12 +166,9 @@ func (resp *response) Write(p []byte) (int, error) {
 	}
 	resp.hasWroteBody = true
 
-	r, toWrite := resp.encodeBody(bytes.NewReader(p))
-	resp.toWrite += toWrite + resp.hdr.Trailer.AllSize()
-	resp.toList = append(resp.toList, r, &trailerReader{
-		Fn:      resp.afterBody,
-		Trailer: &resp.hdr.Trailer,
-	})
+	r, nbody := resp.encodeBody(bytes.NewReader(p))
+	resp.nBody += nbody + resp.hdr.Trailer.AllSize()
+	resp.addTrailerReader(r)
 	resp.remain = 0
 	if err := resp.Flush(); err != nil {
 		return 0, err
@@ -187,12 +188,9 @@ func (resp *response) ReadFrom(r io.Reader) (n int64, err error) {
 	resp.hasWroteBody = true
 
 	remain := resp.remain
-	r, toWrite := resp.encodeBody(io.LimitReader(r, int64(remain)))
-	resp.toWrite += toWrite + resp.hdr.Trailer.AllSize()
-	resp.toList = append(resp.toList, r, &trailerReader{
-		Fn:      resp.afterBody,
-		Trailer: &resp.hdr.Trailer,
-	})
+	r, nbody := resp.encodeBody(r)
+	resp.nBody += nbody + resp.hdr.Trailer.AllSize()
+	resp.addTrailerReader(r)
 	resp.remain = 0
 	if err := resp.Flush(); err != nil {
 		return 0, err
@@ -200,20 +198,80 @@ func (resp *response) ReadFrom(r io.Reader) (n int64, err error) {
 	return int64(remain), nil
 }
 
+func (resp *response) WriteBody(write func(ChecksumBlock, *transport.Stream) (int64, error)) (n int64, err error) {
+	if !resp.hasWroteHeader {
+		if err = resp.WriteHeader(200, NoParameter); err != nil {
+			return 0, err
+		}
+	}
+	if resp.hasWroteBody {
+		return 0, nil
+	}
+	resp.hasWroteBody = true
+
+	if err = resp.Flush(); err != nil {
+		return 0, err
+	}
+	var cb ChecksumBlock
+	if resp.bodyEncoder != nil {
+		cb = resp.bodyEncoder.block
+	}
+	n, err = write(cb, resp.conn)
+	resp.remain -= int(n)
+	if err != nil {
+		resp.connBroken = true
+		return
+	}
+	if resp.remain > 0 {
+		err = io.ErrShortWrite
+		return
+	}
+
+	if resp.afterBody == nil && resp.hdr.Trailer.AllSize() == 0 {
+		return
+	}
+	_, err = resp.conn.SizedWrite(resp.ctx, &trailerReader{
+		Fn:      resp.afterBody,
+		Trailer: &resp.hdr.Trailer,
+	}, resp.hdr.Trailer.AllSize())
+	if err != nil {
+		resp.connBroken = true
+		return
+	}
+	return
+}
+
 func (resp *response) Flush() error {
-	if len(resp.toList) == 0 {
+	all := resp.nHeader + resp.nBody
+	if all == 0 {
 		return nil
 	}
 	if resp.connBroken {
 		return io.ErrClosedPipe
 	}
-	_, err := resp.conn.SizedWrite(resp.ctx, io.MultiReader(resp.toList...), resp.toWrite)
-	if err != nil {
-		resp.connBroken = true
-		return err
+	var err error
+	if resp.bodyAligned {
+		_, err = resp.conn.SizedWrite(resp.ctx, resp.allReader.readers[0], resp.nHeader)
+		if err != nil {
+			resp.connBroken = true
+			return err
+		}
+		resp.allReader.readers = resp.allReader.readers[1:]
+		_, err = resp.conn.SizedWrite(resp.ctx, &resp.allReader, resp.nBody)
+		if err != nil {
+			resp.connBroken = true
+			return err
+		}
+	} else {
+		_, err = resp.conn.SizedWrite(resp.ctx, &resp.allReader, all)
+		if err != nil {
+			resp.connBroken = true
+			return err
+		}
 	}
-	resp.toWrite = 0
-	resp.toList = resp.toList[:0]
+	resp.nHeader = 0
+	resp.nBody = 0
+	resp.allReader.Renew()
 	return nil
 }
 
@@ -230,17 +288,29 @@ func (resp *response) AfterBody(fn func() error) {
 	}
 }
 
+func (resp *response) addTrailerReader(r io.Reader) {
+	resp.allReader.Append(r)
+	if resp.afterBody == nil && resp.hdr.Trailer.AllSize() == 0 {
+		return
+	}
+	resp.allReader.Append(&trailerReader{
+		Fn:      resp.afterBody,
+		Trailer: &resp.hdr.Trailer,
+	})
+}
+
 func (resp *response) options(req *Request) {
 	if req.checksum != (ChecksumBlock{}) && req.checksum.Direction.IsDownload() {
 		resp.bodyEncoder = newEdBody(req.checksum, nil, 0, true)
 	}
+	resp.bodyAligned = req.bodyAligned
 }
 
 func (resp *response) encodeBody(r io.Reader) (io.Reader, int) {
 	if resp.bodyEncoder == nil {
 		return r, resp.remain
 	}
-	resp.bodyEncoder.Body = clientNopBody(io.NopCloser(r))
+	resp.bodyEncoder.Body = clientNopBody(NopCloser(r))
 	return resp.bodyEncoder, int(resp.bodyEncoder.block.EncodeSize(int64(resp.remain)))
 }
 
@@ -264,26 +334,61 @@ func getResponse() *response {
 }
 
 func putResponse(resp *response) {
-	resp.hdr.Status = 0
-	resp.hdr.Reason = ""
-	resp.hdr.Error = ""
-	resp.hdr.ContentLength = 0
 	resp.hdr.Header.Renew()
 	resp.hdr.Trailer.Renew()
-	resp.hdr.Parameter = resp.hdr.Parameter[:0]
-
-	resp.ctx = nil
-	resp.conn = nil
-	resp.connBroken = false
-
-	resp.hasWroteHeader = false
-	resp.hasWroteBody = false
-	resp.bodyEncoder = nil
-
-	resp.remain = 0
-	resp.toWrite = 0
-	resp.toList = resp.toList[:0]
-	resp.afterBody = nil
-
+	resp.allReader.Renew()
+	*resp = response{
+		hdr: ResponseHeader{
+			Version:   resp.hdr.Version,
+			Magic:     resp.hdr.Magic,
+			Header:    resp.hdr.Header,
+			Trailer:   resp.hdr.Trailer,
+			Parameter: resp.hdr.Parameter[:0],
+		},
+		allReader: resp.allReader,
+	}
 	poolResponse.Put(resp) // nolint: staticcheck
+}
+
+type eofReader struct{}
+
+func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+type multiReader struct {
+	origins []io.Reader
+	readers []io.Reader
+}
+
+func (mr *multiReader) Append(r io.Reader) {
+	mr.readers = append(mr.readers, r)
+	mr.origins = mr.readers
+}
+
+func (mr *multiReader) Renew() {
+	mr.readers = mr.origins[:0]
+	mr.origins = mr.readers
+}
+
+// Read copy of io.MultiReader.
+func (mr *multiReader) Read(p []byte) (n int, err error) {
+	for len(mr.readers) > 0 {
+		if len(mr.readers) == 1 {
+			if r, ok := mr.readers[0].(*multiReader); ok {
+				mr.readers = r.readers
+				continue
+			}
+		}
+		n, err = mr.readers[0].Read(p)
+		if err == io.EOF {
+			mr.readers[0] = eofReader{} // permit earlier GC
+			mr.readers = mr.readers[1:]
+		}
+		if n > 0 || err != io.EOF {
+			if err == io.EOF && len(mr.readers) > 0 {
+				err = nil
+			}
+			return
+		}
+	}
+	return 0, io.EOF
 }

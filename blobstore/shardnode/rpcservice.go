@@ -24,16 +24,12 @@ import (
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 )
 
-var (
-	_service *service
-	conf     Config
-)
-
 func init() {
 	mod := &cmd.Module{
 		Name:       proto.ServiceNameShardNode,
 		InitConfig: initConfig,
 		SetUp2:     setUp,
+		SetUp:      setUpHttp,
 		TearDown:   tearDown,
 	}
 	cmd.RegisterModule(mod)
@@ -71,7 +67,8 @@ func (s *RpcService) DeleteBlob(w rpc2.ResponseWriter, req *rpc2.Request) error 
 	}
 	span.Debugf("receive DeleteBlob request, args:%+v", args)
 
-	return s.deleteBlob(ctx, args)
+	_, err := s.deleteBlob(ctx, args)
+	return err
 }
 
 func (s *RpcService) FindAndDeleteBlob(w rpc2.ResponseWriter, req *rpc2.Request) error {
@@ -83,7 +80,7 @@ func (s *RpcService) FindAndDeleteBlob(w rpc2.ResponseWriter, req *rpc2.Request)
 	}
 	span.Debugf("receive FindAndDeleteBlob request, args:%+v", args)
 
-	ret, err := s.findAndDeleteBlob(ctx, args)
+	ret, err := s.deleteBlob(ctx, args)
 	if err != nil {
 		span.Errorf("find and delete failed, err: %s, name: %s", errors.Detail(err), string(args.Name))
 		return err
@@ -234,6 +231,18 @@ func (s *RpcService) ListItem(w rpc2.ResponseWriter, req *rpc2.Request) error {
 	return w.WriteOK(&ret)
 }
 
+func (s *RpcService) DeleteBlobRaw(w rpc2.ResponseWriter, req *rpc2.Request) error {
+	ctx := req.Context()
+	span := req.Span()
+
+	args := &shardnode.DeleteBlobRawArgs{}
+	if err := req.ParseParameter(args); err != nil {
+		return err
+	}
+	span.Debugf("receive DeleteBlobRaw request, args:%+v", args)
+	return s.deleteBlobRaw(ctx, args)
+}
+
 func (s *RpcService) AddShard(w rpc2.ResponseWriter, req *rpc2.Request) error {
 	ctx := req.Context()
 	span := req.Span()
@@ -365,6 +374,11 @@ func (s *RpcService) ListVolume(w rpc2.ResponseWriter, req *rpc2.Request) error 
 	return w.WriteOK(ret)
 }
 
+func (s *RpcService) DeleteBlobStats(w rpc2.ResponseWriter, req *rpc2.Request) error {
+	ret := s.deleteBlobStats()
+	return w.WriteOK(ret)
+}
+
 func (s *RpcService) TCMallocStats(w rpc2.ResponseWriter, req *rpc2.Request) error {
 	ret := &shardnode.TCMallocRet{
 		Stats: tcmalloc.Stats(),
@@ -409,9 +423,6 @@ func initConfig(args []string) (*cmd.Config, error) {
 	if err := config.Load(&conf); err != nil {
 		return nil, err
 	}
-	conf.Rpc2Server.Addresses = []rpc2.NetworkAddress{
-		{Network: "tcp", Address: conf.BindAddr},
-	}
 	return &conf.Config, nil
 }
 
@@ -446,14 +457,17 @@ func newHandler(s *RpcService) *rpc2.Router {
 
 	handler.Register("/db/stats", s.DBStats)
 
+	handler.Register("/blob/delete/raw", s.DeleteBlobRaw)
+	handler.Register("/blob/delete/stats", s.DeleteBlobStats)
+
 	return handler
 }
 
 func setUp() (*rpc2.Router, []rpc2.Interceptor) {
-	_service = newService(&conf)
-	return newHandler(&RpcService{_service}), nil
+	globalService = newService(&conf)
+	return newHandler(&RpcService{globalService}), nil
 }
 
 func tearDown() {
-	_service.close()
+	globalService.close()
 }

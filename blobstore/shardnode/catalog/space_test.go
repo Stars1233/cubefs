@@ -29,7 +29,7 @@ import (
 	apierr "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/security"
-	"github.com/cubefs/cubefs/blobstore/shardnode/mock"
+	mock "github.com/cubefs/cubefs/blobstore/testing/mockshardnode"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 )
 
@@ -52,6 +52,7 @@ func newMockSpace(tb testing.TB) (*mockSpace, func()) {
 		IndexOption: proto.IndexOptionNull,
 	}
 	handler := mock.NewMockSpaceShardHandler(C(tb))
+	handler.EXPECT().ShardingSubRangeCount().Return(2).AnyTimes()
 
 	sg := mock.NewMockShardGetter(C(tb))
 	sg.EXPECT().GetShard(A, A).Return(handler, nil).AnyTimes()
@@ -98,10 +99,10 @@ func TestSpace_Item(t *testing.T) {
 	require.Equal(t, apierr.ErrShardDoesNotExist, err)
 	// get
 	gomock.InOrder(mockSpace.mockHandler.EXPECT().GetItem(A, A, A).Return(shardnode.Item{Fields: fields}, nil))
-	ret, err := mockSpace.space.GetItem(ctx, oph, []byte{1})
+	ret, err := mockSpace.space.GetItem(ctx, oph, "1")
 	require.Nil(t, err)
 	require.Equal(t, shardnode.Item{Fields: fields}, ret)
-	_, err = mockSpace.shardErrSpace.GetItem(ctx, oph, []byte{99})
+	_, err = mockSpace.shardErrSpace.GetItem(ctx, oph, "99")
 	require.Equal(t, apierr.ErrShardDoesNotExist, err)
 	// update
 	gomock.InOrder(mockSpace.mockHandler.EXPECT().UpdateItem(A, A, A, A).Return(nil))
@@ -116,23 +117,23 @@ func TestSpace_Item(t *testing.T) {
 	// list
 	gomock.InOrder(mockSpace.mockHandler.EXPECT().ListItem(A, A, A, A, A).Return([]shardnode.Item{
 		{
-			ID:     []byte("1"),
+			ID:     "1",
 			Fields: fields,
 		},
 		{
-			ID:     []byte("2"),
+			ID:     "2",
 			Fields: fields,
 		},
 	}, mockSpace.space.generateSpaceKey([]byte("3")), nil))
-	_, marker, err := mockSpace.space.ListItem(ctx, oph, nil, nil, 2)
+	_, marker, err := mockSpace.space.ListItem(ctx, oph, "", "", 2)
 	require.Nil(t, err)
-	require.Equal(t, []byte("3"), marker)
+	require.Equal(t, "3", marker)
 
 	// delete
 	gomock.InOrder(mockSpace.mockHandler.EXPECT().DeleteItem(A, A, A).Return(nil))
-	err = mockSpace.space.DeleteItem(ctx, oph, []byte{1})
+	err = mockSpace.space.DeleteItem(ctx, oph, "1")
 	require.Nil(t, err)
-	err = mockSpace.shardErrSpace.DeleteItem(ctx, oph, []byte{1})
+	err = mockSpace.shardErrSpace.DeleteItem(ctx, oph, "1")
 	require.Equal(t, apierr.ErrShardDoesNotExist, err)
 }
 
@@ -154,11 +155,11 @@ func TestSpace_CreateBlob(t *testing.T) {
 		},
 	}
 
-	name := []byte("blob")
+	name := "blob"
 	oph := shardnode.ShardOpHeader{}
 	args := &shardnode.CreateBlobArgs{
 		Header:    oph,
-		Name:      name,
+		Name:      string(name),
 		CodeMode:  codemode.EC6P6,
 		Size_:     1024 * 10,
 		SliceSize: 64,
@@ -218,7 +219,7 @@ func TestSpace_AllocSlice(t *testing.T) {
 		{Vid: 1, MinSliceID: 2, Count: 20, ValidSize: 0},
 		{Vid: 1, MinSliceID: 3, Count: 30, ValidSize: 0},
 	}
-	name := []byte("blob")
+	name := "blob"
 	mode := codemode.EC6P6
 	b := proto.Blob{
 		Name: name,
@@ -291,7 +292,7 @@ func TestSpace_SealBlob(t *testing.T) {
 		{Vid: 1, MinSliceID: 3, Count: 10, ValidSize: 0},
 		{Vid: 1, MinSliceID: 4, Count: 20, ValidSize: 0},
 	}
-	name := []byte("blob")
+	name := "blob"
 	mode := codemode.EC6P6
 	b := proto.Blob{
 		Name: name,
@@ -372,32 +373,13 @@ func TestSpace_DeleteBlob(t *testing.T) {
 	defer cleanSpace()
 	space := mockSpace.space
 
-	mockSpace.mockHandler.EXPECT().DeleteBlob(A, A, A).Return(nil)
+	mockSpace.mockHandler.EXPECT().DeleteBlob(A, A, A, A).Return(nil)
 
 	err := space.DeleteBlob(ctx, &shardnode.DeleteBlobArgs{
 		Header: shardnode.ShardOpHeader{},
-		Name:   []byte("blob"),
-	})
+		Name:   "blob",
+	}, []shardnode.Item{})
 	require.Nil(t, err)
-}
-
-func TestSpace_FindAndDeleteBlob(t *testing.T) {
-	ctx := context.Background()
-	mockSpace, cleanSpace := newMockSpace(t)
-	defer cleanSpace()
-	space := mockSpace.space
-
-	blob := proto.Blob{Name: []byte("blob"), Location: proto.Location{CodeMode: codemode.EC6P6}}
-
-	mockSpace.mockHandler.EXPECT().DeleteBlob(A, A, A).Return(nil)
-	mockSpace.mockHandler.EXPECT().GetBlob(A, A, A).Return(blob, nil)
-
-	ret, err := space.FindAndDeleteBlob(ctx, &shardnode.DeleteBlobArgs{
-		Header: shardnode.ShardOpHeader{},
-		Name:   []byte("blob"),
-	})
-	require.Nil(t, err)
-	require.Equal(t, ret.Blob, blob)
 }
 
 func TestSpace_ListBlob(t *testing.T) {
@@ -407,15 +389,15 @@ func TestSpace_ListBlob(t *testing.T) {
 
 	blobs := make([]proto.Blob, 0)
 	for i := 0; i < 10; i++ {
-		blob := proto.Blob{Name: []byte(fmt.Sprintf("b%d", i)), Location: proto.Location{CodeMode: codemode.EC6P6}}
+		blob := proto.Blob{Name: fmt.Sprintf("b%d", i), Location: proto.Location{CodeMode: codemode.EC6P6}}
 		blobs = append(blobs, blob)
 	}
 
-	nextMarker := []byte("next")
+	nextMarker := "next"
 	mockSpace.mockHandler.EXPECT().ListBlob(A, A, A, A, A).Return(
-		blobs, space.generateSpaceKey(nextMarker), nil,
+		blobs, space.generateSpaceKey([]byte(nextMarker)), nil,
 	)
-	blobs, m, err := space.ListBlob(ctx, shardnode.ShardOpHeader{}, nil, []byte("b1"), 10)
+	blobs, m, err := space.ListBlob(ctx, shardnode.ShardOpHeader{}, "", "b1", 10)
 	require.Nil(t, err)
 	require.Equal(t, nextMarker, m)
 	require.Equal(t, 10, len(blobs))

@@ -16,6 +16,7 @@ package blobnode
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -30,7 +31,8 @@ import (
 )
 
 const (
-	MaxShardSize = math.MaxUint32
+	MaxShardSize        = math.MaxUint32
+	GetShardsHeaderSize = 4
 )
 
 type ShardInfo struct {
@@ -38,8 +40,18 @@ type ShardInfo struct {
 	Bid    proto.BlobID `json:"bid"`
 	Size   int64        `json:"size"`
 	Crc    uint32       `json:"crc"`
+	Offset int64        `json:"offset"`
 	Flag   ShardStatus  `json:"flag"` // 1:normal,2:markDelete
 	Inline bool         `json:"inline"`
+
+	NopData bool `json:"nopdata"` // data all zero
+}
+
+type BidInfo struct {
+	Bid    proto.BlobID `json:"bid"`
+	Size   int64        `json:"size"`
+	Offset int64        `json:"offset"`
+	Crc    uint32       `json:"crc"`
 }
 
 type ShardStatus uint8
@@ -52,7 +64,10 @@ const (
 
 const (
 	ShardDataInline = 0x80 // 1000 0000
+	ShardDataNop    = 0x40 // 0100 0000
 )
+
+var putWithCrcOption = []rpc.Option{rpc.WithCrcEncode()}
 
 type PutShardArgs struct {
 	DiskID proto.DiskID `json:"diskid"`
@@ -61,6 +76,8 @@ type PutShardArgs struct {
 	Size   int64        `json:"size"`
 	Type   IOType       `json:"iotype,omitempty"`
 	Body   io.Reader    `json:"-"`
+
+	NopData bool `json:"nopdata,omitempty"`
 }
 
 type PutShardRet struct {
@@ -87,14 +104,20 @@ func (c *client) PutShard(ctx context.Context, host string, args *PutShardArgs) 
 	}
 	urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
 		host, args.DiskID, args.Vuid, args.Bid, args.Size, args.Type)
+	if args.NopData {
+		urlStr += "&nopdata=true"
+	}
 	req, err := http.NewRequest(http.MethodPost, urlStr, args.Body)
 	if err != nil {
 		err = convertEIO(err)
 		return
 	}
-	req.ContentLength = args.Size
-	err = c.DoWith(ctx, req, ret, rpc.WithCrcEncode())
-	if err == nil {
+	var opts []rpc.Option
+	if !args.NopData {
+		req.ContentLength = args.Size
+		opts = putWithCrcOption
+	}
+	if err = c.DoWith(ctx, req, ret, opts...); err == nil {
 		crc = ret.Crc
 	}
 
@@ -220,7 +243,8 @@ func (c *client) MarkDeleteShard(ctx context.Context, host string, args *DeleteS
 
 	urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", host, args.DiskID, args.Vuid, args.Bid)
 	err = c.PostWith(ctx, urlStr, nil, rpc.NoneBody)
-	return
+
+	return convertEIO(err)
 }
 
 func (c *client) DeleteShard(ctx context.Context, host string, args *DeleteShardArgs) (err error) {
@@ -231,13 +255,15 @@ func (c *client) DeleteShard(ctx context.Context, host string, args *DeleteShard
 
 	urlStr := fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", host, args.DiskID, args.Vuid, args.Bid)
 	err = c.PostWith(ctx, urlStr, nil, rpc.NoneBody)
-	return
+
+	return convertEIO(err)
 }
 
 type StatShardArgs struct {
 	DiskID proto.DiskID `json:"diskid"`
 	Vuid   proto.Vuid   `json:"vuid"`
 	Bid    proto.BlobID `json:"bid"`
+	Type   IOType       `json:"iotype,omitempty"`
 }
 
 func (c *client) StatShard(ctx context.Context, host string, args *StatShardArgs) (si *ShardInfo, err error) {
@@ -246,11 +272,12 @@ func (c *client) StatShard(ctx context.Context, host string, args *StatShardArgs
 		return
 	}
 
-	urlStr := fmt.Sprintf("%v/shard/stat/diskid/%v/vuid/%v/bid/%v",
-		host, args.DiskID, args.Vuid, args.Bid)
+	urlStr := fmt.Sprintf("%v/shard/stat/diskid/%v/vuid/%v/bid/%v?iotype=%d",
+		host, args.DiskID, args.Vuid, args.Bid, args.Type)
 	si = &ShardInfo{}
 	err = c.GetWith(ctx, urlStr, si)
-	return
+
+	return si, convertEIO(err)
 }
 
 type ListShardsArgs struct {
@@ -278,6 +305,7 @@ func (c *client) ListShards(ctx context.Context, host string, args *ListShardsAr
 	listRet := ListShardsRet{}
 	err = c.GetWith(ctx, urlStr, &listRet)
 	if err != nil {
+		err = convertEIO(err)
 		return nil, proto.InValidBlobID, err
 	}
 
@@ -290,4 +318,116 @@ func convertEIO(err error) error {
 	}
 
 	return err
+}
+
+type GetShardsArgs struct {
+	DiskID proto.DiskID `json:"diskid"`
+	Vuid   proto.Vuid   `json:"vuid" `
+	Bids   []BidInfo    `json:"bids"`
+	Type   IOType       `json:"type"`
+}
+
+func (c *client) GetShards(ctx context.Context, host string, args *GetShardsArgs) (getter ShardGetter, err error) {
+	if !args.Type.IsValid() {
+		err = bloberr.ErrInvalidParam
+		return
+	}
+	if !IsValidDiskID(args.DiskID) {
+		err = bloberr.ErrInvalidDiskId
+		return
+	}
+	urlStr := fmt.Sprintf("%v/shards/get", host)
+
+	resp, err := c.Post(ctx, urlStr, args)
+	if err != nil {
+		err = convertEIO(err)
+		return
+	}
+	if resp.StatusCode/100 != 2 {
+		defer resp.Body.Close()
+		err = rpc.ParseResponseErr(resp)
+		return
+	}
+	return &shardGetter{bids: args.Bids, body: resp.Body}, nil
+}
+
+type ShardGetter interface {
+	// NextShard before read next shard must read all data of last shard, if not will get unexpect error
+	NextShard(ctx context.Context) (body io.ReadCloser, err error, ok bool)
+	Close() error
+}
+
+type shardGetter struct {
+	body io.ReadCloser
+	bids []BidInfo
+	idx  int
+}
+
+func (b *shardGetter) NextShard(ctx context.Context) (io.ReadCloser, error, bool) {
+	span := trace.SpanFromContextSafe(ctx)
+	if b.idx >= len(b.bids) {
+		return nil, nil, false
+	}
+	var header ShardsHeader
+	_, err := io.ReadFull(b.body, header[:])
+	if err != nil {
+		return nil, err, true
+	}
+	code := header.Get()
+	if code != 200 {
+		span.Errorf("download shard failed, errCode: %s", code)
+		return nil, bloberr.ErrBidNotMatch, true
+	}
+	bid := b.bids[b.idx]
+	b.idx++
+	return io.NopCloser(io.LimitReader(b.body, bid.Size)), nil, true
+}
+
+func (b *shardGetter) Close() error {
+	return b.body.Close()
+}
+
+type shardWriter struct {
+	header        int
+	headerWritten bool
+
+	shard io.WriterTo
+}
+
+func NewShardWriter(header int, shard io.WriterTo) io.WriterTo {
+	return &shardWriter{header: header, shard: shard}
+}
+
+func (s *shardWriter) WriteTo(w io.Writer) (int64, error) {
+	if s.headerWritten {
+		return s.shard.WriteTo(w)
+	}
+	// write header
+	var header ShardsHeader
+	header.Set(s.header)
+	start := int64(0)
+	for start < int64(len(header)) {
+		n, err := w.Write(header[start:])
+		if err != nil {
+			return start, err
+		}
+		start += int64(n)
+	}
+	s.headerWritten = true
+	if s.header != http.StatusOK {
+		return int64(len(header)), bloberr.ErrBidNotMatch
+	}
+	// write data
+	n, err := s.shard.WriteTo(w)
+	return n + start, err
+}
+
+type ShardsHeader [GetShardsHeaderSize]byte
+
+func (s *ShardsHeader) Set(code int) {
+	binary.BigEndian.PutUint32(s[:], uint32(code))
+}
+
+func (s *ShardsHeader) Get() int {
+	return int(binary.BigEndian.Uint32(s[:]))
 }

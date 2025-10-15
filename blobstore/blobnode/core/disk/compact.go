@@ -31,6 +31,125 @@ const (
 	setCompactInterval      = 100 * time.Millisecond
 )
 
+func (ds *DiskStorage) EnqueueCompact(ctx context.Context, vuid proto.Vuid) {
+	ds.compactCh <- vuid
+}
+
+func (ds *DiskStorage) CompactChunkInternal(ctx context.Context, vuid proto.Vuid) (err error) {
+	span := trace.SpanFromContextSafe(ctx)
+
+	cs, found := ds.GetChunkStorage(vuid)
+	if !found {
+		span.Errorf("cannot happened. vuid:%v not found", vuid)
+		return bloberr.ErrNoSuchVuid
+	}
+
+	// no lock here. compact chunk. generate new chunkfile
+	ncs, err := cs.StartCompact(ctx)
+	if err != nil {
+		span.Errorf("Failed start compact, err:%v", err)
+		_ = cs.StopCompact(ctx, nil)
+		return err
+	}
+
+	// The following logic, for the same vuid, only allows serial execution
+	if ds.ChunkLimitPerKey.Acquire(vuid) != nil {
+		return bloberr.ErrOverload
+	}
+	defer ds.ChunkLimitPerKey.Release(vuid)
+
+	ncsMeta := ncs.VuidMeta()
+	ncsMeta.Status = cs.Status()
+	ncsMeta.Mtime = time.Now().UnixNano()
+
+	// insert new chunkmeta. no side effect.
+	err = ds.SuperBlock.UpsertChunk(ctx, ncs.ID(), *ncsMeta)
+	if err != nil {
+		span.Errorf("Failed upsert chunk<%s>, err:%v", ncs.ID(), err)
+		goto STOPCOMPACT
+	}
+
+	// MUST: any writing and deletion must be prohibited
+
+	// vuid change to new chunkfile
+	err = ds.SuperBlock.BindVuidChunk(ctx, vuid, ncs.ID())
+	if err != nil {
+		span.Errorf("Failed vuid[%d] bind new chunkfile[%s]", vuid, ncs.ID())
+		goto STOPCOMPACT
+	}
+	span.Warnf("compact insert new chunkmeta, vuid[%d] bind new chunkfile[%s]", vuid, ncs.ID())
+
+	// change memory fd.
+	err = cs.CommitCompact(ctx, ncs)
+	if err != nil {
+		span.Errorf("Failed start compact, err:%v", err)
+		goto STOPCOMPACT
+	}
+
+STOPCOMPACT:
+	// compact done and enable modify
+	err = cs.StopCompact(ctx, ncs)
+	if err != nil {
+		span.Errorf("Failed StopCompact vuid[%d] newchunkfile[%s]", vuid, ncsMeta.ChunkID)
+		return err
+	}
+
+	// wait old stg all request done, and then mark destroy ncs
+	err = ds.destroyRedundant(ctx, ncs)
+	if err != nil {
+		span.Errorf("Failed update chunk[%s] status. err:%v", ncsMeta.ChunkID, err)
+	}
+
+	span.Warnf("compact success. vuid[%d] chunkfile[%s]", vuid, cs.ID())
+
+	return nil
+}
+
+func (ds *DiskStorage) ExecCompactChunk(vuid proto.Vuid) (err error) {
+	span, ctx := trace.StartSpanFromContextWithTraceID(context.Background(), "", base.BackgroudReqID("Compact"+ds.Conf.Path))
+
+	cs, found := ds.GetChunkStorage(vuid)
+	if !found {
+		span.Errorf("cannot happened. vuid:%d not found", vuid)
+		return bloberr.ErrNoSuchVuid
+	}
+	if !cs.NeedCompact(ctx) {
+		span.Infof("dont need do compact, vuid:%d, chunkFile:%s", vuid, cs.ID())
+		return nil
+	}
+
+	// Persistent compacting field
+	err = ds.UpdateChunkCompactState(ctx, vuid, true)
+	if err != nil {
+		span.Errorf("update chunk(%v) compacting failed: %v", vuid, err)
+		return err
+	}
+
+	err = ds.notifyCompacting(ctx, vuid, true)
+	if err != nil {
+		span.Errorf("set chunk(%v) compacting failed: %v", vuid, err)
+		return
+	}
+
+	// do compact internal
+	if err = ds.CompactChunkInternal(ctx, vuid); err != nil {
+		span.Errorf("Failed compact vuid:%v, err:%v", vuid, err)
+		return err
+	}
+
+	if err = ds.notifyCompacting(ctx, vuid, false); err != nil {
+		span.Errorf("set chunk(%v) compacting failed: %v", vuid, err)
+		return err
+	}
+
+	if err = ds.UpdateChunkCompactState(ctx, vuid, false); err != nil {
+		span.Errorf("Failed update vuid:%v state, err:%v", vuid, err)
+		return err
+	}
+
+	return nil
+}
+
 func (ds *DiskStorage) loopCompactFile() {
 	span, _ := trace.StartSpanFromContextWithTraceID(context.Background(), "", "Compact"+ds.Conf.Path)
 
@@ -94,79 +213,6 @@ func (ds *DiskStorage) runCompactFiles() {
 	}
 }
 
-func (ds *DiskStorage) EnqueueCompact(ctx context.Context, vuid proto.Vuid) {
-	ds.compactCh <- vuid
-}
-
-func (ds *DiskStorage) CompactChunkInternal(ctx context.Context, vuid proto.Vuid) (err error) {
-	span := trace.SpanFromContextSafe(ctx)
-
-	cs, found := ds.GetChunkStorage(vuid)
-	if !found {
-		span.Errorf("cannot happened. vuid:%v not found", vuid)
-		return bloberr.ErrNoSuchVuid
-	}
-
-	// no lock here. compact chunk. generate new chunkfile
-	ncs, err := cs.StartCompact(ctx)
-	if err != nil {
-		span.Errorf("Failed start compact, err:%v", err)
-		_ = cs.StopCompact(ctx, nil)
-		return err
-	}
-
-	// The following logic, for the same vuid, only allows serial execution
-	if ds.ChunkLimitPerKey.Acquire(vuid) != nil {
-		return bloberr.ErrOverload
-	}
-	defer ds.ChunkLimitPerKey.Release(vuid)
-
-	ncsMeta := ncs.VuidMeta()
-	ncsMeta.Status = cs.Status()
-	ncsMeta.Mtime = time.Now().UnixNano()
-
-	// insert new chunkmeta. no side effect.
-	err = ds.SuperBlock.UpsertChunk(ctx, ncs.ID(), *ncsMeta)
-	if err != nil {
-		span.Errorf("Failed upsert chunk<%s>, err:%v", ncs.ID(), err)
-		goto STOPCOMPACT
-	}
-
-	// MUST: any writing and deletion must be prohibited
-
-	// vuid change to new chunkfile
-	err = ds.SuperBlock.BindVuidChunk(ctx, vuid, ncs.ID())
-	if err != nil {
-		span.Errorf("Failed vuid[%d] bind new chunkfile[%s]", vuid, ncs.ID())
-		goto STOPCOMPACT
-	}
-
-	// change memory fd.
-	err = cs.CommitCompact(ctx, ncs)
-	if err != nil {
-		span.Errorf("Failed start compact, err:%v", err)
-		goto STOPCOMPACT
-	}
-
-STOPCOMPACT:
-	// compact done and enable modify
-	err = cs.StopCompact(ctx, ncs)
-	if err != nil {
-		span.Errorf("Failed StopCompact vuid[%d] newchunkfile[%s]", vuid, ncsMeta.ChunkID)
-		return err
-	}
-
-	// mark destroy ncs
-	err = ds.destroyRedundant(ctx, ncs)
-	if err != nil {
-		span.Errorf("Failed update chunk[%s] status. err:%v", ncsMeta.ChunkID, err)
-	}
-
-	span.Warnf("compact success. vuid[%d] chunkfile[%s]", vuid, cs.ID())
-
-	return nil
-}
-
 func (ds *DiskStorage) destroyRedundant(ctx context.Context, ncs core.ChunkAPI) (err error) {
 	span := trace.SpanFromContextSafe(ctx)
 
@@ -175,7 +221,7 @@ func (ds *DiskStorage) destroyRedundant(ctx context.Context, ncs core.ChunkAPI) 
 
 	// wait old stg all request done；
 	for {
-		time.Sleep(10 * time.Second)
+		time.Sleep(time.Duration(ds.Conf.WaitPendingReqIntervalSec) * time.Second)
 		if !ncs.HasPendingRequest() {
 			break
 		}
@@ -193,46 +239,6 @@ func (ds *DiskStorage) destroyRedundant(ctx context.Context, ncs core.ChunkAPI) 
 	ncsMeta.Mtime = time.Now().UnixNano()
 
 	return ds.SuperBlock.UpsertChunk(ctx, ncsMeta.ChunkID, *ncsMeta)
-}
-
-func (ds *DiskStorage) ExecCompactChunk(vuid proto.Vuid) (err error) {
-	span, ctx := trace.StartSpanFromContextWithTraceID(context.Background(), "", base.BackgroudReqID("Compact"+ds.Conf.Path))
-
-	_, found := ds.GetChunkStorage(vuid)
-	if !found {
-		return bloberr.ErrNoSuchVuid
-	}
-
-	// Persistent compacting field
-	err = ds.UpdateChunkCompactState(ctx, vuid, true)
-	if err != nil {
-		span.Errorf("update chunk(%v) compacting failed: %v", vuid, err)
-		return err
-	}
-
-	err = ds.notifyCompacting(ctx, vuid, true)
-	if err != nil {
-		span.Errorf("set chunk(%v) compacting failed: %v", vuid, err)
-		return
-	}
-
-	// do compact internal
-	if err = ds.CompactChunkInternal(ctx, vuid); err != nil {
-		span.Errorf("Failed compact vuid:%v, err:%v", vuid, err)
-		return err
-	}
-
-	if err = ds.notifyCompacting(ctx, vuid, false); err != nil {
-		span.Errorf("set chunk(%v) compacting failed: %v", vuid, err)
-		return err
-	}
-
-	if err = ds.UpdateChunkCompactState(ctx, vuid, false); err != nil {
-		span.Errorf("Failed update vuid:%v state, err:%v", vuid, err)
-		return err
-	}
-
-	return nil
 }
 
 func (ds *DiskStorage) notifyCompacting(ctx context.Context, vuid proto.Vuid, compacting bool) (

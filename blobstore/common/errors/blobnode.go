@@ -58,6 +58,8 @@ const (
 	CodeRequestLimited          = 673
 	CodeUnsupportedTaskCodeMode = 674
 	CodePutShardTimeout         = 675
+	CodeIOCtxCancel             = 676
+	CodeBidNotMatch             = 677
 )
 
 var (
@@ -102,6 +104,8 @@ var (
 	ErrRequestLimited          = Error(CodeRequestLimited)
 	ErrUnsupportedTaskCodeMode = Error(CodeUnsupportedTaskCodeMode)
 	ErrPutShardTimeout         = Error(CodePutShardTimeout)
+	ErrBidNotMatch             = Error(CodeBidNotMatch)
+	ErrIOCtxCancel             = Error(CodeIOCtxCancel)
 )
 
 var ErrShardMayBeLost = errors.New("shard may be lost")

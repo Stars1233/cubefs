@@ -15,9 +15,14 @@
 package crc32block
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"hash/crc32"
 	"io"
+	"sync"
+
+	"github.com/cubefs/cubefs/blobstore/util"
 )
 
 const (
@@ -53,7 +58,7 @@ func EncodeSize(size int64, blockLen int64) int64 {
 		panic(ErrInvalidBlock)
 	}
 	payload := BlockPayload(blockLen)
-	blockCnt := (size + (payload - 1)) / payload
+	blockCnt := util.AlignedBlocks(size, payload)
 	return size + crc32Len*blockCnt
 }
 
@@ -61,7 +66,7 @@ func DecodeSize(totalSize int64, blockLen int64) int64 {
 	if !isValidBlockLen(blockLen) {
 		panic(ErrInvalidBlock)
 	}
-	blockCnt := (totalSize + (blockLen - 1)) / blockLen
+	blockCnt := util.AlignedBlocks(totalSize, blockLen)
 	return totalSize - crc32Len*blockCnt
 }
 
@@ -109,4 +114,52 @@ func readFullOrToEnd(r io.Reader, buffer []byte) (n int, err error) {
 	}
 
 	return n, err
+}
+
+var (
+	_k16        = 16 << 10
+	_buffer16k  = make([]byte, _k16)
+	_bufferZero = make([]byte, _k16)
+	_mapZeroCrc = sync.Map{}
+)
+
+func ConstZeroCrc(size int) uint32 {
+	if size < 0 {
+		return 0
+	}
+	if val, ok := _mapZeroCrc.Load(size); ok {
+		return val.(uint32)
+	}
+
+	w := crc32.NewIEEE()
+	remain := size
+	for remain > 0 {
+		if remain <= _k16 {
+			w.Write(_buffer16k[:remain])
+			break
+		}
+		w.Write(_buffer16k)
+		remain -= _k16
+	}
+	crc := w.Sum32()
+
+	_mapZeroCrc.Store(size, crc)
+	return crc
+}
+
+func IsZeroBuffer(buffer []byte) bool {
+	const width = 8
+	if len(buffer) > width {
+		if binary.BigEndian.Uint64(buffer[:width]) != 0 {
+			return false
+		}
+	}
+	for len(buffer) > 0 {
+		minl := util.Min(len(buffer), _k16)
+		if !bytes.Equal(buffer[:minl], _bufferZero[:minl]) {
+			return false
+		}
+		buffer = buffer[minl:]
+	}
+	return true
 }

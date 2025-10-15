@@ -64,6 +64,11 @@ var testServiceCfg = &Config{
 			Enable:    true,
 		},
 	},
+	VolumeCodeModeExtends: []codemode.ExtendCodeMode{{
+		CodeMode: 254,
+		Name:     "TestClusterMgrEC3P3L1",
+		Tactic:   codemode.Tactic{N: 3, M: 3, L: 1, AZCount: 1, PutQuorum: 5},
+	}},
 	ShardCodeModeName:        codemode.Replica3.Name(),
 	ClusterCfg:               map[string]interface{}{},
 	ClusterReportIntervalS:   1,
@@ -240,9 +245,14 @@ func TestNewService(t *testing.T) {
 	cfg.ClusterCfg[proto.VolumeReserveSizeKey] = "20000000"
 	os.Mkdir(cfg.DBPath, 0o755)
 
+	cfg.BlobNodeDiskMgrConfig.ReservedSpace = -1
+	cfg.ShardNodeDiskMgrConfig.ReservedSpace = 1 << 10
+
 	testService, err := New(&cfg)
 	require.NoError(t, err)
 	require.NotNil(t, testService)
+	require.Equal(t, int64(0), cfg.BlobNodeDiskMgrConfig.ReservedSpace)
+	require.Equal(t, int64(1<<10), cfg.ShardNodeDiskMgrConfig.ReservedSpace)
 
 	mc := testService.RaftConfig.ServerConfig.Members[0].Context
 	memberContext := &clustermgr.MemberContext{}
@@ -272,4 +282,40 @@ func GetFreePort() int {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+func TestBrokenChunkNumReport(t *testing.T) {
+	testService, clean := initServiceWithData()
+	defer clean()
+
+	cmClient := initTestClusterClient(testService)
+	ctx := newCtx()
+	err := cmClient.SetDisk(ctx, 1, proto.DiskStatusBroken)
+	require.NoError(t, err)
+	err = cmClient.SetDisk(ctx, 2, proto.DiskStatusBroken)
+	require.NoError(t, err)
+	err = cmClient.SetDisk(ctx, 1, proto.DiskStatusRepairing)
+	require.NoError(t, err)
+
+	vids := testService.getBrokenVolumes(ctx, 0)
+	require.NotNil(t, vids)
+	testService.reportBrokenChunkNumInVolume(vids)
+}
+
+func TestBrokenShardUnitNumReport(t *testing.T) {
+	testService, clean := initServiceWithShardData()
+	defer clean()
+
+	cmClient := initTestClusterClient(testService)
+	ctx := newCtx()
+	err := cmClient.SetShardNodeDisk(ctx, 1, proto.DiskStatusBroken)
+	require.NoError(t, err)
+	err = cmClient.SetShardNodeDisk(ctx, 2, proto.DiskStatusBroken)
+	require.NoError(t, err)
+	err = cmClient.SetShardNodeDisk(ctx, 1, proto.DiskStatusRepairing)
+	require.NoError(t, err)
+
+	shards := testService.getBrokenShards(ctx, 0)
+	require.NotNil(t, shards)
+	testService.reportBrokenUnitNumInShard(shards)
 }

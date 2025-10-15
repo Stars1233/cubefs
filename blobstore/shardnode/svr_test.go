@@ -35,6 +35,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
 	"github.com/cubefs/cubefs/blobstore/shardnode/storage"
+	_ "github.com/cubefs/cubefs/blobstore/testing/nolog"
 	"github.com/cubefs/cubefs/blobstore/util"
 )
 
@@ -59,6 +60,9 @@ type (
 )
 
 func TestSvr_Loop(t *testing.T) {
+	// Reset global service instance before each test
+	resetGlobalService()
+
 	cfg := genTestServiceCfg()
 
 	path, err := util.GenTmpPath()
@@ -72,6 +76,10 @@ func TestSvr_Loop(t *testing.T) {
 	cfg.HeartBeatIntervalS = 1
 	cfg.ReportIntervalS = 1
 	cfg.RouteUpdateIntervalS = 1
+	delLogDir, err := os.MkdirTemp(os.TempDir(), "delete_log")
+	require.NoError(t, err)
+	defer os.RemoveAll(delLogDir)
+	cfg.DeleteBlobCfg.DeleteLog.Dir = delLogDir
 
 	s := newService(cfg)
 	time.Sleep(3 * time.Second)
@@ -79,9 +87,16 @@ func TestSvr_Loop(t *testing.T) {
 }
 
 func TestSvr_HandleEIO(t *testing.T) {
+	// Reset global service instance before each test
+	resetGlobalService()
+
 	cfg := genTestServiceCfg()
 	cfg.WaitReOpenDiskIntervalS = 1
 	cfg.WaitRepairCloseDiskIntervalS = 1
+	delLogDir, err := os.MkdirTemp(os.TempDir(), "delete_log")
+	require.NoError(t, err)
+	defer os.RemoveAll(delLogDir)
+	cfg.DeleteBlobCfg.DeleteLog.Dir = delLogDir
 
 	s := newService(cfg)
 	disk := &storage.Disk{}
@@ -100,6 +115,32 @@ func TestSvr_HandleEIO(t *testing.T) {
 	s.handleEIO(ctx, repairDiskID, syscall.EIO)
 	time.Sleep(3 * time.Second)
 	os.RemoveAll(repairDiskPath)
+}
+
+func TestSingletonPattern(t *testing.T) {
+	// Reset global service instance before test
+	resetGlobalService()
+
+	cfg := genTestServiceCfg()
+	delLogDir, err := os.MkdirTemp(os.TempDir(), "delete_log")
+	require.NoError(t, err)
+	defer os.RemoveAll(delLogDir)
+	cfg.DeleteBlobCfg.DeleteLog.Dir = delLogDir
+
+	// First call to newService
+	service1 := newService(cfg)
+	require.NotNil(t, service1)
+
+	// Second call to newService with different config
+	cfg2 := genTestServiceCfg()
+	cfg2.NodeConfig.NodeID = 999 // Different config
+	service2 := newService(cfg2)
+
+	// Both should return the same instance
+	require.Equal(t, service1, service2)
+
+	// Clean up
+	service1.close()
 }
 
 func init() {
@@ -197,6 +238,8 @@ func (mcm *mockClusterMgr) GetConfig(c *rpc.Context) {
 	key := args.Key
 	var value string
 	switch key {
+	case proto.CodeModeExtendKey:
+		value = "[]"
 	case proto.CodeModeConfigKey:
 		policy := []codemode.Policy{
 			{ModeName: codemode.EC6P6.Name(), MinSize: 0, MaxSize: 0, SizeRatio: 0.3, Enable: true},
@@ -296,4 +339,10 @@ func genTestServiceCfg() *Config {
 		CmConfig: cc,
 	}
 	return cfg
+}
+
+// resetGlobalService resets the global service instance (mainly for testing purposes)
+func resetGlobalService() {
+	globalService = nil
+	serviceOnce = sync.Once{}
 }
